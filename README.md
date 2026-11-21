@@ -1,6 +1,6 @@
 # QuickPool / awsquick2api
 
-Amazon Quick 原生桌面 OAuth、多账号池与 OpenAI Chat Completions 兼容网关。参考 Antigravity-Manager 和 workbuddy2api-panel 的授权与调度思路，独立实现。运行时不依赖官方 exe，不读取官方客户端凭据库，不使用网页 Cookie、HAR 或浏览器配置。
+Amazon Quick 原生桌面 OAuth、多账号池与 OpenAI Chat Completions、Responses / Anthropic Messages 兼容网关。参考 Antigravity-Manager 和 workbuddy2api-panel 的授权与调度思路，独立实现。运行时不依赖官方 exe，不读取官方客户端凭据库，不使用网页 Cookie、HAR 或浏览器配置。
 
 协议核对版本为官方桌面客户端 **1.2.4660**。本项目与 Amazon / AWS 无隶属关系；请使用自己有权使用的账号，并遵守服务规则与配额。
 
@@ -86,7 +86,56 @@ for chunk in stream:
 
 **工具与 JSON 是提示词适配层，不是原生 Outpost/MCP 函数注册。**模型获得客户端函数定义并返回 JSON，网关验证函数名、参数和选择约束后才生成 OpenAI `tool_calls`，不会替客户端执行函数。工具与结构化响应先缓冲、验证，再返回非流式或标准 SSE；普通文本仍实时输出。模型不遵守格式会返回 502，不伪造成功。原生 MCP 注册机制已有研究，但尚未作为此兼容接口的实现。
 
-暂不提供 `/v1/responses`、音频、视频或任意文件协议。不编造 token usage，也不保证所有 OpenAI 参数均改变上游行为；例如 temperature/max_tokens 不对应此版本已核对的桌面字段。仅 `n=1`。
+同时提供下面的 Responses / Messages 兼容接口。暂不提供音频、视频或任意文件协议；不保证所有参数均改变上游行为，例如 temperature/max_tokens 不对应此版本已核对的桌面字段。仅 `n=1`。Responses 的 usage 为 null；Messages 必需的数值 usage 与 count_tokens 使用本地 UTF-8 字节启发式估算，通过 `X-QuickPool-Usage: estimated` 标注，不是官方 tokenizer、真实计费或 AWS 剩余配额。
+
+## Codex CLI / Claude Code
+
+三种协议复用同一账号池、12 个模型名、原生授权刷新和客户端工具适配：
+
+- OpenAI Chat Completions：`POST /v1/chat/completions`。
+- OpenAI Responses：`POST /v1/responses`，支持字符串/消息数组 input、instructions、function/custom 工具、namespace、call_id 工具结果，以及 Responses SSE 事件。
+- Anthropic Messages：`POST /v1/messages`，支持 system、text/image、tool_use/tool_result、tool_choice 和 Messages SSE 事件；接受 `x-api-key` 或 Bearer API Key。
+- `POST /v1/messages/count_tokens` 提供**本地估算**，不向 AWS 发送请求。
+- 同时提供 `/responses`、`/messages`、`/messages/count_tokens` 别名，兼容不同 base URL 拼接方式。
+
+Codex 在独立 provider 下使用 Responses。合并到自己的 `~/.codex/config.toml`，API Key 放入环境变量，不写入源码：
+
+```toml
+model_provider = "quickpool"
+model = "amazon-smart"
+model_reasoning_effort = "none"
+web_search = "disabled"
+
+[model_providers.quickpool]
+name = "QuickPool"
+base_url = "http://127.0.0.1:8045/v1"
+env_key = "QUICKPOOL_API_KEY"
+wire_api = "responses"
+```
+
+```powershell
+$env:QUICKPOOL_API_KEY = "YOUR_QUICKPOOL_API_KEY"
+codex -m amazon-smart
+```
+
+将模型改为 `amazon-smart-high` 等即可选择名称后缀；若同时配置 `model_reasoning_effort`，显式 effort 优先，需同步改成 `high` 或删除该行。
+
+Claude Code 使用根地址（不带 `/v1`），并将所需角色映射为 QuickPool 已公布的模型名：
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8045"
+$env:ANTHROPIC_API_KEY = "YOUR_QUICKPOOL_API_KEY"
+$env:ANTHROPIC_MODEL = "amazon-smart"
+$env:ANTHROPIC_DEFAULT_OPUS_MODEL = "amazon-smart-high"
+$env:ANTHROPIC_DEFAULT_SONNET_MODEL = "amazon-balance"
+$env:ANTHROPIC_DEFAULT_HAIKU_MODEL = "amazon-quick"
+$env:CLAUDE_CODE_SUBAGENT_MODEL = "amazon-balance"
+claude --model amazon-smart
+```
+
+Linux/macOS 对应使用 `export NAME=value`。API Key 使用 `data/api.key`，不是管理密钥。未知 `gpt-*` / `claude-*` 名称仍报错，不自动替换模型。
+
+**接口边界：**每次须发送完整历史；不存储可检索 Response，也不支持 previous_response_id、conversation、background 或 store=true。普通文本实时 SSE；工具输出先缓冲并校验 JSON，然后发送各协议的工具事件。Responses custom 工具映射成 `arguments.input` 字符串，不提供服务端 grammar 执行器。Messages thinking/output_config.effort 映射到 Quick 思考深度，不生成虚假的 thinking 内容；budget_tokens 以 8192/16384 为 medium/high 分界，其余为 low，不能承诺精确推理 token 预算。Anthropic 缓存提示不启用服务端提示缓存。内置 web_search/computer_use 等服务端工具、压缩会话、WebSocket Responses、音频和 PDF 等任意文件类型会被拒绝或没有路由。工具协议兼容不等于 AWS 原生函数调用或与原模型等价的编码能力。
 
 ## 多号调度与剩余额度
 
@@ -163,6 +212,7 @@ node tests/test_admin_session.cjs
 - `quickpool/native_protocol.py`：Gateway/AIDP 桌面编码与事件。
 - `quickpool/native_upstream.py`：原生 WebSocket、图片上传与交付。
 - `quickpool/compat.py`：消息、工具与 JSON 兼容层。
+- `quickpool/cli_api.py`：Responses / Messages 请求、SSE 和 CLI 工具结果适配。
 - `quickpool/quota.py`：原生月度/会话配额。
 - `quickpool/transfer.py`：加密迁移 API 逻辑与 CLI。
 - `quickpool/main.py`、`pool.py`、`store.py`：管理路由、调度与加密持久化。

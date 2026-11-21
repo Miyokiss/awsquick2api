@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__
+from .cli_api import register_cli_routes
 from .compat import CompatibilityError, Prepared
 from .models import MODEL_IDS, AccountCreate, AccountPatch, ChatRequest, NativeLoginRequest, model_options
 from .native_auth import AuthError, NativeAuth
@@ -88,6 +89,8 @@ def create_app(data_dir: Path | None = None, transport=None, ws_connect=None):
 
     def api_access(request: Request):
         token = request.headers.get("authorization", "").removeprefix("Bearer ")
+        if request.url.path in ('/messages', '/v1/messages', '/messages/count_tokens', '/v1/messages/count_tokens'):
+            token = token or request.headers.get('x-api-key', '')
         store = request.app.state.store
         if not hmac.compare_digest(token.encode(), store.api_key.encode()):
             raise HTTPException(401, "API 密钥无效")
@@ -367,6 +370,8 @@ def create_app(data_dir: Path | None = None, transport=None, ws_connect=None):
         return {"id": request_id, "object": "chat.completion", "created": created, "model": value.model,
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
                              "finish_reason": "stop"}]}
+
+    register_cli_routes(app, completions, api_access)
 
     static = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=static), name="static")
