@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark"><title>QuickPool · Amazon Quick 网关</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/app.css"><script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="QuickPool 首页"><span class="brand-icon">q<span>↗</span></span><span>QuickPool<small>AMAZON QUICK GATEWAY</small></span></a>
+      <div class="workspace-label">工作空间 <span>LOCAL</span></div>
+      <nav aria-label="主导航">
+        <button class="nav-item selected" data-page="overview"><span class="nav-icon">◫</span>运行总览<span class="nav-arrow">↗</span></button>
+        <button class="nav-item" data-page="accounts"><span class="nav-icon">▤</span>账号池<span class="count" id="nav-count">0</span></button>
+        <button class="nav-item" data-page="connect"><span class="nav-icon">⌘</span>API 接入</button>
+        <button class="nav-item" data-page="logs"><span class="nav-icon">≡</span>请求日志</button>
+      </nav>
+      <div class="sidebar-note"><span class="tiny-label">一个入口，多个会话</span><p>把你的 Amazon Quick 账号<br>接入统一的本地 API。</p><span class="note-line"></span><span class="mono">OPENAI COMPATIBLE</span></div>
+      <div class="sidebar-bottom"><span class="connection"><i id="connection-dot"></i><span id="connection-label">等待连接</span></span><span class="mono" id="version">v0.1.0</span></div>
+    </aside>
+    <main>
+      <header class="topbar"><div class="breadcrumb">工作空间 <span>/</span> <strong id="breadcrumb">运行总览</strong></div><div class="top-actions"><span class="local-badge"><span></span> 本地部署</span><button id="logout" class="icon-button" title="退出管理" aria-label="退出管理">⇥</button></div></header>
+      <div class="content">
+        <div class="page-heading"><div><div class="eyebrow">YOUR ACCOUNTS. ONE ENDPOINT.</div><h1 id="page-title">让每一次请求，都有着落<span class="accent">。</span></h1><p id="page-description">管理 Amazon Quick 会话，查看账号状态与代理请求。</p></div><div class="heading-actions"><button class="button subtle" id="refresh"><span id="refresh-icon">↻</span> 刷新</button><button class="button primary" id="add-account">＋ 添加账号</button></div></div>
+
+        <section data-section="overview" aria-label="运行总览">
+          <div class="metrics">
+            <article class="metric"><div class="metric-label">可用账号 <span>↗</span></div><div class="metric-number"><span id="stat-ready">0</span><small>/ <span id="stat-total">0</span></small></div><div class="metric-foot"><i class="status-dot green"></i><span id="stat-account-note">尚未添加账号</span></div></article>
+            <article class="metric"><div class="metric-label">近 24 小时请求 <span>↗</span></div><div class="metric-number" id="stat-requests">0</div><div class="metric-foot">包含转发尝试与连通性测试</div></article>
+            <article class="metric"><div class="metric-label">请求成功率 <span>↗</span></div><div class="metric-number"><span id="stat-rate">—</span><small id="rate-unit"></small></div><div class="metric-foot" id="stat-success-note">等待第一条请求</div></article>
+            <article class="metric"><div class="metric-label">平均响应耗时 <span>↗</span></div><div class="metric-number"><span id="stat-latency">—</span><small>s</small></div><div class="metric-foot">成功请求的完整响应时间</div></article>
+          </div>
+          <div class="endpoint-strip"><div class="endpoint-icon">⌘</div><div class="endpoint-info"><span>你的统一 API 入口</span><code id="endpoint-label"></code></div><span class="protocol-badge">OpenAI compatible</span><button class="button compact" id="copy-endpoint">复制地址 <span>⧉</span></button></div>
+          <div class="section-heading"><div><h2>账号池 <span class="pill" id="pool-count">0 个账号</span></h2><p>独立会话 · 加权调度 · 异常冷却</p></div><button class="text-button" data-goto="accounts">管理全部账号 ↗</button></div>
+          <div id="overview-accounts"></div>
+          <div class="bottom-grid"><article class="panel getting-started"><div class="panel-kicker">GET CONNECTED <span>01 — 03</span></div><h2>三步，连接你的 Quick。</h2><ol><li><span>01</span><div><strong>添加账号</strong><p>为每个 Quick 身份建立独立的账号记录。</p></div></li><li><span>02</span><div><strong>使用原生授权</strong><p>选择账号类型，在自己的 Edge 中完成 PKCE 授权。</p></div></li><li><span>03</span><div><strong>测试通过，开始代理</strong><p>验证实际转发后，复制 Base URL 和 API Key 接入客户端。</p></div></li></ol></article><article class="panel route-panel"><div class="panel-kicker">REQUEST ROUTING <span class="live-label"><i></i> 实时状态</span></div><div class="route"><div><span class="route-node">⌘</span><strong>你的客户端</strong><small>OpenAI 协议</small></div><span class="route-line">→</span><div><span class="route-node gateway">q↗</span><strong>QuickPool</strong><small>加权最少连接</small></div><span class="route-line">→</span><div><span class="route-node">▤</span><strong>Quick 账号池</strong><small id="route-ready">0 个可用会话</small></div></div><div class="route-caption"><i class="status-dot orange"></i><span>仅在输出开始前重试，避免流式回复重复。</span></div></article></div>
+        </section>
+
+        <section data-section="accounts" hidden aria-label="账号池"><div class="filter-bar"><label class="search-field"><span>⌕</span><input id="account-search" type="search" placeholder="搜索账号名称或 AWS 账号 ID" aria-label="搜索账号"></label><div class="filter-info" id="account-summary">0 个账号</div><button class="button compact" id="export-accounts">加密导出</button><button class="button compact" id="import-accounts">导入账号</button></div><div id="all-accounts"></div><div class="notice">每个账号独立保存原生授权令牌，服务会自动刷新。授权完成后仍需实际测试；需要重新登录的账号会暂停参与调度。</div></section>
+
+        <section data-section="connect" hidden aria-label="API 接入"><div class="connect-grid"><article class="panel config-panel"><div class="panel-kicker">CONNECTION DETAILS</div><h2>接入配置</h2><label>Base URL</label><div class="copy-field"><code id="config-url"></code><button class="icon-button" id="copy-config-url" aria-label="复制 Base URL">⧉</button></div><label>API Key <span>仅用于客户端，独立于管理密钥</span></label><div class="copy-field"><code id="config-key">••••••••••••••••••••••••</code><button class="icon-button" id="reveal-key" aria-label="显示 API Key">◉</button><button class="icon-button" id="copy-key" aria-label="复制 API Key">⧉</button></div><label>模型名称</label><div class="copy-field model-names"><code>amazon-quick / amazon-balance / amazon-smart<br>后缀：-low / -medium / -high</code></div><div class="notice">不带后缀关闭思考。Quick 的 fast 模式在官方客户端会关闭思考；其深度后缀按请求透传，是否生效由服务决定。工具与 JSON 输出使用提示词适配并缓冲验证，不是原生函数直传。</div></article><article class="panel code-panel"><div class="code-heading"><h2>发送第一条请求</h2><button class="text-button" id="copy-example">复制代码 ⧉</button></div><div class="code-tabs"><button class="active" data-code="python">Python</button><button data-code="curl">cURL</button></div><pre><code id="code-example"></code></pre></article></div><article class="panel playground"><div class="code-heading"><div><div class="panel-kicker">LIVE PLAYGROUND</div><h2>测试你的账号池</h2></div><span class="pill">实际调用上游</span></div><form id="playground-form"><label for="playground-model">模型与思考深度</label><select id="playground-model" class="model-select"><option>amazon-quick</option></select><label class="sr-only" for="playground-input">测试消息</label><textarea id="playground-input" placeholder="输入一条消息，验证完整的代理链路…" rows="3" required maxlength="120000"></textarea><div class="playground-actions"><span id="playground-status">请先确保至少有一个可用账号</span><button class="button primary" id="playground-send" type="submit">发送请求 ↗</button></div></form><pre id="playground-output" hidden aria-live="polite"></pre></article></section>
+
+        <section data-section="logs" hidden aria-label="请求日志"><div class="section-heading"><div><h2>最近请求</h2><p>最多保留 10,000 条记录，此处展示最近 100 条。不会记录消息正文或凭据。</p></div><span class="pill" id="log-count">0 条</span></div><div class="table-wrap"><table><thead><tr><th>请求 / 时间</th><th>账号</th><th>状态</th><th>完整耗时</th><th>输出字符</th><th>说明</th></tr></thead><tbody id="logs-body"></tbody></table><div id="logs-empty" class="empty compact-empty"><span class="empty-symbol">≡</span><h3>还没有请求记录</h3><p>账号测试和代理调用会在这里留下记录。</p></div></div></section>
+        <footer class="main-footer"><span>QuickPool <span class="accent">/</span> 独立开发的 Amazon Quick 本地代理</span><span class="mono">LOCAL FIRST · SESSION ISOLATED</span></footer>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="auth-dialog" class="auth-dialog"><form id="auth-form"><span class="brand-icon">q<span>↗</span></span><div class="eyebrow">QUICKPOOL CONSOLE</div><h2>连接你的本地网关</h2><p>输入管理密钥以访问账号池。首次启动后，密钥保存在服务数据目录的 <code>admin.key</code> 中。</p><label for="admin-key">管理密钥</label><input type="password" id="admin-key" autocomplete="current-password" required placeholder="粘贴 admin.key 中的密钥"><p id="auth-error" class="form-error" aria-live="polite"></p><button class="button primary full-width" type="submit">进入管理控制台 ↗</button><div class="auth-footer"><i class="status-dot green"></i> 凭据仅发送至当前本地服务</div></form></dialog>
+  <dialog id="account-dialog"><form id="account-form"><div class="dialog-heading"><h2>添加 Quick 账号</h2><button type="button" class="icon-button" data-close="account-dialog" aria-label="关闭">×</button></div><p class="muted">每个账号独立保存原生授权与刷新令牌。</p><label for="account-name">账号名称</label><input id="account-name" placeholder="例如：工作账号" required maxlength="80"><label for="login-url">Quick 工作区地址</label><input id="login-url" type="url" value="https://quick.aws.com/sn" required><div class="form-columns"><div><label for="account-weight">调度权重</label><input id="account-weight" type="number" min="1" max="100" value="1" required></div><div><label for="account-concurrency">最大并发</label><input id="account-concurrency" type="number" min="1" max="8" value="1" required></div></div><p class="form-error" id="account-error" aria-live="polite"></p><div class="dialog-footer"><button type="button" class="button" data-close="account-dialog">取消</button><button class="button primary" type="submit">创建账号 ↗</button></div></form></dialog>
+  <dialog id="login-dialog" aria-labelledby="login-title">
+    <form id="authorization-form">
+      <div class="dialog-heading"><h2 id="login-title">原生账号授权 <small id="login-account-name"></small></h2><button type="button" class="icon-button" data-close="login-dialog" aria-label="关闭">×</button></div>
+      <p class="muted">使用 Quick 桌面客户端的 PKCE 授权流程。请在自己的 Edge 中完成登录与 MFA，服务收到授权后自动保存并刷新令牌。</p>
+      <div class="notice">多账号请使用不同的 Edge 配置文件或 InPrivate 窗口登录。不要为了切换账号退出已有 Quick 网页会话；网页注销可能使该账号的原生授权随后失效。</div>
+      <div class="form-columns"><div><label for="auth-provider">账号类型</label><select id="auth-provider" class="model-select"><option value="social">个人账号 · Google / GitHub 等</option><option value="enterprise">企业 QuickSight 账号</option></select></div><div><label for="auth-region">AWS 区域</label><input id="auth-region" value="us-east-1" placeholder="us-east-1" required maxlength="40" pattern="[a-z0-9-]+" autocomplete="off"></div></div>
+      <div class="login-steps"><p><b>1.</b> 选择账号类型与区域，生成授权链接。</p><button id="start-authorization" class="button primary" type="submit">生成授权链接 ↗</button><p><b>2.</b> 在 Edge 中打开链接。也可以复制后粘贴到自己的浏览器。</p>
+        <div id="authorization-link-box" class="copy-field" hidden><code><a id="authorization-link" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">正在准备授权链接…</a></code><button type="button" class="icon-button" id="copy-authorization-url" aria-label="复制授权链接" disabled>⧉</button></div>
+        <p><b>3.</b> 完成授权后，返回这里点击「实际测试」。</p>
+      </div>
+      <p id="login-status" class="muted" role="status" aria-live="polite">尚未授权</p><p id="login-expiry" class="muted"></p><p id="login-error" class="form-error" aria-live="polite"></p>
+      <div class="notice">密码和 MFA 验证码只在 Amazon 授权页面输入。关闭本弹窗会停止状态轮询；需要终止本次流程时，请点击「取消授权」。</div>
+      <div class="dialog-footer"><button type="button" id="cancel-authorization" class="button" hidden>取消授权</button><button type="button" class="button" data-close="login-dialog">返回账号池</button><button type="button" id="authorization-test" class="button primary" hidden>实际测试 ↗</button></div>
+    </form>
+  </dialog>
+  <dialog id="transfer-dialog" aria-labelledby="transfer-title"><form id="transfer-form">
+    <div class="dialog-heading"><h2 id="transfer-title">账号迁移</h2><button type="button" class="icon-button" data-close="transfer-dialog" aria-label="关闭">×</button></div>
+    <p class="muted">使用密码加密原生授权凭据；不包含本机管理密钥、API Key 或数据库加密密钥。迁移到服务器前先停止源端，避免两个实例同时刷新同一份授权。</p>
+    <input id="transfer-action" type="hidden"><div id="transfer-file-row"><label for="transfer-file">加密账号文件</label><input id="transfer-file" type="file" accept=".json,application/json"></div>
+    <label for="transfer-passphrase">迁移密码（至少 12 位）</label><input id="transfer-passphrase" type="password" minlength="12" maxlength="1024" autocomplete="off" required>
+    <p id="transfer-error" class="form-error" aria-live="polite"></p><div class="dialog-footer"><button type="button" class="button" data-close="transfer-dialog">取消</button><button class="button primary" type="submit">执行迁移</button></div>
+  </form></dialog>
+  <div id="toast" role="status" hidden></div>
+</body>
+</html>

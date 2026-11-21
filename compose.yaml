@@ -1,0 +1,13 @@
+services:
+  quickpool:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8045:8045"
+    volumes:
+      - quickpool-data:/app/data
+    security_opt:
+      - no-new-privileges:true
+volumes:
+  quickpool-data:
+
