@@ -16,7 +16,7 @@ from tests.test_gateway import add, request
 pytest_plugins = ["tests.test_gateway"]
 
 
-@pytest.mark.parametrize('model', MODEL_IDS)
+@pytest.mark.parametrize('model', MODEL_IDS + tuple(m.removeprefix('amazon-') for m in MODEL_IDS))
 def test_each_model_reaches_native_payload(gateway, model):
     client, _app, _admin, key, backend = gateway
     add(gateway,state='ready')
@@ -25,8 +25,47 @@ def test_each_model_reaches_native_payload(gateway, model):
     assert result.json()['model'] == model
     native = next(m['payload'] for m in backend.connections[-1]['socket'].sent if m['type']=='user_message')
     parts = model.removeprefix('amazon-').split('-')
-    assert native['agent_mode'] == {'quick':'fast','balance':'balanced','smart':'smart'}[parts[0]]
+    assert native['agent_mode'] == parts[0]
     assert native['thinking_effort'] == (parts[1] if len(parts)>1 else 'off')
+
+
+def test_models_match_upstream_vocabulary_and_default(gateway):
+    client, _app, admin, key, _backend = gateway
+    expected = ['amazon-' + mode + suffix for mode in ('fast', 'balanced', 'smart')
+                for suffix in ('', '-low', '-medium', '-high')]
+    assert [m['id'] for m in client.get('/v1/models', headers=key).json()['data']] == expected
+    config = client.get('/api/config', headers=admin).json()
+    assert config['models'] == expected and config['model'] == 'amazon-fast'
+    default = ChatRequest(messages=[{'role': 'user', 'content': 'Hello'}])
+    assert (default.model, default.mode, default.effort) == ('amazon-fast', 'fast', 'off')
+
+
+@pytest.mark.parametrize('mode', ['fast', 'balanced', 'smart'])
+def test_explicit_agent_mode_is_forwarded_without_translation(gateway, mode):
+    client, _app, _admin, key, backend = gateway
+    add(gateway, state='ready')
+    result = request(client, key, model='amazon-smart-high', agent_mode=mode, thinking_effort='medium')
+    assert result.status_code == 200
+    native = next(m['payload'] for m in backend.connections[-1]['socket'].sent if m['type'] == 'user_message')
+    assert native['agent_mode'] == mode and native['thinking_effort'] == 'medium'
+
+
+@pytest.mark.parametrize('mode', ['quick', 'balance'])
+def test_old_explicit_agent_mode_is_rejected(gateway, mode):
+    client, _app, _admin, key, backend = gateway
+    add(gateway, state='ready')
+    assert request(client, key, agent_mode=mode).status_code == 422
+    assert not backend.connections
+
+
+@pytest.mark.parametrize('old', [prefix + mode + suffix for prefix in ('amazon-', '')
+                               for mode in ('quick', 'balance')
+                               for suffix in ('', '-low', '-medium', '-high')])
+def test_removed_model_names_do_not_fall_back(gateway, old):
+    client, _app, _admin, key, backend = gateway
+    add(gateway, state='ready')
+    assert request(client, key, model=old).status_code == 422
+    assert not backend.connections
 
 
 def test_bad_model_no_fallback_and_masked_config(gateway):

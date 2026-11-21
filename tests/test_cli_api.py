@@ -5,6 +5,7 @@ import pytest
 from fastapi.responses import StreamingResponse
 
 from quickpool.cli_api import message_stream, prepare, response_stream
+from quickpool.models import MODEL_IDS
 from tests.test_gateway import add
 
 pytest_plugins = ['tests.test_gateway']
@@ -25,6 +26,30 @@ def payload(protocol, stream=False, **extra):
 
 def events(response):
     return [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith('data: ')]
+
+
+@pytest.mark.parametrize('protocol', ['responses', 'messages'])
+@pytest.mark.parametrize('model', MODEL_IDS + tuple(m.removeprefix('amazon-') for m in MODEL_IDS))
+def test_model_vocabulary_reaches_upstream_unchanged(gateway, protocol, model):
+    client, _app, _admin, key, backend = gateway
+    add(gateway, state='ready')
+    response = client.post('/v1/' + protocol, headers=key, json=payload(protocol, model=model))
+    assert response.status_code == 200, response.text
+    assert response.json()['model'] == model
+    mode, _, effort = model.removeprefix('amazon-').partition('-')
+    native = next(m['payload'] for m in backend.connections[-1]['socket'].sent if m['type'] == 'user_message')
+    assert native['agent_mode'] == mode and native['thinking_effort'] == (effort or 'off')
+
+
+@pytest.mark.parametrize('protocol', ['responses', 'messages'])
+@pytest.mark.parametrize('old', ['amazon-quick', 'amazon-quick-high', 'quick-medium',
+                               'amazon-balance', 'amazon-balance-high', 'balance-low', 'hark'])
+def test_removed_model_names_are_rejected(gateway, protocol, old):
+    client, _app, _admin, key, backend = gateway
+    add(gateway, state='ready')
+    response = client.post('/v1/' + protocol, headers=key, json=payload(protocol, model=old))
+    assert response.status_code == 400
+    assert not backend.connections
 
 
 @pytest.mark.parametrize('protocol', ['responses', 'messages'])

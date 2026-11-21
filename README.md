@@ -50,15 +50,15 @@ access / refresh token 使用本机 Fernet 密钥加密持久化。服务提前�
 
 `GET /v1/models` 返回三组、每组四个名称：
 
-- `amazon-quick`、`amazon-quick-low`、`amazon-quick-medium`、`amazon-quick-high`
-- `amazon-balance`、`amazon-balance-low`、`amazon-balance-medium`、`amazon-balance-high`
+- `amazon-fast`、`amazon-fast-low`、`amazon-fast-medium`、`amazon-fast-high`
+- `amazon-balanced`、`amazon-balanced-low`、`amazon-balanced-medium`、`amazon-balanced-high`
 - `amazon-smart`、`amazon-smart-low`、`amazon-smart-medium`、`amazon-smart-high`
 
-无后缀为 `off`；后缀对应 `low / medium / high`。短名 `quick / balance / smart` 及其深度后缀也是明确别名。未知模型名直接报错，不自动回退。
+无后缀为 `off`；后缀对应 `low / medium / high`。短名 `fast / balanced / smart` 及其深度后缀也是明确别名。未知模型名直接报错，不自动回退。旧的 `amazon-quick*`、`amazon-balance*`、`quick*`、`balance*` 名称不再接受，请更新客户端配置。
 
-模式映射为 `quick → fast`、`balance → balanced`、`smart → smart`，通过官方 `agent_mode`、`thinking_effort` 字段发送。它们是 Quick 的路由模式，不是任意指定底层 Claude 等模型。也支持标准 `reasoning_effort`，以及 `agent_mode` / `thinking_effort` 扩展字段；显式字段优先于名称后缀，默认为关闭思考。
+模型名直接使用上游的 `fast / balanced / smart`，模式名称不做转换，通过官方 `agent_mode`、`thinking_effort` 字段发送；显式 `agent_mode` 也只接受这三个上游值。它们是 Quick 的路由模式，不是任意指定底层 Claude 等模型。也支持标准 `reasoning_effort`，以及 `agent_mode` / `thinking_effort` 扩展字段；显式字段优先于名称后缀，默认为关闭思考。
 
-**Quick/fast 限制：**官方此版本的固定能力逻辑会把 fast 的思考深度归为 off。代理保留并透传所选后缀，12 个组合均已取得真实聊天回复，但 HTTP 200 不能证明 fast 开启了思考；最终能力取决于账号配置与 AWS 服务。需要思考时优先使用 balance/smart 后缀。
+**fast 限制：**官方此版本的固定能力逻辑会把 fast 的思考深度归为 off。代理保留并透传所选后缀，12 个组合均已取得真实聊天回复，但 HTTP 200 不能证明 fast 开启了思考；最终能力取决于账号配置与 AWS 服务。需要思考时优先使用 balanced/smart 后缀。
 
 ```python
 from openai import OpenAI
@@ -127,9 +127,9 @@ $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8045"
 $env:ANTHROPIC_API_KEY = "YOUR_QUICKPOOL_API_KEY"
 $env:ANTHROPIC_MODEL = "amazon-smart"
 $env:ANTHROPIC_DEFAULT_OPUS_MODEL = "amazon-smart-high"
-$env:ANTHROPIC_DEFAULT_SONNET_MODEL = "amazon-balance"
-$env:ANTHROPIC_DEFAULT_HAIKU_MODEL = "amazon-quick"
-$env:CLAUDE_CODE_SUBAGENT_MODEL = "amazon-balance"
+$env:ANTHROPIC_DEFAULT_SONNET_MODEL = "amazon-balanced"
+$env:ANTHROPIC_DEFAULT_HAIKU_MODEL = "amazon-fast"
+$env:CLAUDE_CODE_SUBAGENT_MODEL = "amazon-balanced"
 claude --model amazon-smart
 ```
 

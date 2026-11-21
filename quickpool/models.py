@@ -86,10 +86,13 @@ class Message(BaseModel):
         return self
 
 
-MODEL_IDS = tuple('amazon-' + mode + suffix for mode in ('quick', 'balance', 'smart')
+DEFAULT_MODEL = 'amazon-fast'
+NATIVE_MODES = ('fast', 'balanced', 'smart')
+
+MODEL_IDS = tuple('amazon-' + mode + suffix for mode in NATIVE_MODES
                   for suffix in ('', '-low', '-medium', '-high'))
 MODEL_ALIASES = {mode + suffix: 'amazon-' + mode + suffix
-                 for mode in ('quick', 'balance', 'smart') for suffix in ('', '-low', '-medium', '-high')}
+                 for mode in NATIVE_MODES for suffix in ('', '-low', '-medium', '-high')}
 
 
 def model_options(model: str):
@@ -97,17 +100,17 @@ def model_options(model: str):
     if canonical not in MODEL_IDS:
         raise ValueError('未知模型名，请从 GET /v1/models 选择')
     parts = canonical.removeprefix('amazon-').split('-')
-    return {'quick': 'fast', 'balance': 'balanced', 'smart': 'smart'}[parts[0]], parts[1] if len(parts) > 1 else 'off'
+    return parts[0], parts[1] if len(parts) > 1 else 'off'
 
 
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
-    model: str = Field(default='amazon-quick', min_length=1, max_length=128)
+    model: str = Field(default=DEFAULT_MODEL, min_length=1, max_length=128)
     messages: list[Message] = Field(min_length=1, max_length=100)
     stream: bool = False
     stream_options: dict[str, Any] | None = None
     reasoning_effort: Literal['none', 'minimal', 'low', 'medium', 'high', 'off'] | None = None
-    agent_mode: Literal['quick', 'balance', 'smart'] | None = None
+    agent_mode: Literal['fast', 'balanced', 'smart'] | None = None
     thinking_effort: Literal['off', 'low', 'medium', 'high'] | None = None
     tools: list[dict[str, Any]] | None = Field(default=None, max_length=64)
     tool_choice: str | dict[str, Any] | None = None
@@ -118,7 +121,7 @@ class ChatRequest(BaseModel):
 
     @property
     def mode(self):
-        return {'quick':'fast', 'balance':'balanced', 'smart':'smart'}.get(self.agent_mode) or model_options(self.model)[0]
+        return self.agent_mode or model_options(self.model)[0]
 
     @property
     def effort(self):

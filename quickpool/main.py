@@ -18,7 +18,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from . import __version__
 from .cli_api import register_cli_routes
 from .compat import CompatibilityError, Prepared
-from .models import MODEL_IDS, AccountCreate, AccountPatch, ChatRequest, NativeLoginRequest, model_options
+from .models import (
+    DEFAULT_MODEL,
+    MODEL_IDS,
+    AccountCreate,
+    AccountPatch,
+    ChatRequest,
+    NativeLoginRequest,
+    model_options,
+)
 from .native_auth import AuthError, NativeAuth
 from .native_upstream import Upstream, UpstreamError
 from .pool import Pool, PoolUnavailable
@@ -116,7 +124,7 @@ def create_app(data_dir: Path | None = None, transport=None, ws_connect=None):
 
     @app.get("/api/config", dependencies=[Depends(admin)])
     async def config():
-        return {"api_key_masked": 'sk-quick-••••••••', "model": "amazon-quick", "models": list(MODEL_IDS), "version": __version__,
+        return {"api_key_masked": 'sk-quick-••••••••', "model": DEFAULT_MODEL, "models": list(MODEL_IDS), "version": __version__,
                 "strategy": "weighted-least-connections", "max_attempts": 3}
 
     @app.post('/api/config/reveal-key', dependencies=[Depends(admin)])

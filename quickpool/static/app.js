@@ -102,7 +102,7 @@ async function refreshQuotaCache() {
 }
 async function loadConfig() {
   state.config = await api('/api/config');
-  const options = state.config.models || ['amazon-quick'];
+  const options = state.config.models || ['amazon-fast'];
   $('#playground-model').replaceChildren(...options.map(id => { const option = document.createElement('option'); option.value = id; option.textContent = id; return option; }));
   renderCode();
 }
@@ -111,8 +111,8 @@ function renderCode() {
   text('#endpoint-label', baseURL); text('#config-url', baseURL);
   if (!state.keyVisible) text('#config-key', state.config?.api_key_masked || '••••••••••••••••••••••••');
   const examples = {
-    python: `from openai import OpenAI\n\nclient = OpenAI(\n    base_url="${baseURL}",\n    api_key="YOUR_QUICKPOOL_API_KEY",\n)\n\nstream = client.chat.completions.create(\n    model="amazon-quick",\n    messages=[\n        {"role": "user", "content": "你好"}\n    ],\n    stream=True,\n)\nfor chunk in stream:\n    print(chunk.choices[0].delta.content or "", end="")`,
-    curl: `curl ${baseURL}/chat/completions \\\n  -H "Authorization: Bearer YOUR_QUICKPOOL_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{\n    "model": "amazon-quick",\n    "messages": [{\n      "role": "user",\n      "content": "你好"\n    }],\n    "stream": true\n  }'`};
+    python: `from openai import OpenAI\n\nclient = OpenAI(\n    base_url="${baseURL}",\n    api_key="YOUR_QUICKPOOL_API_KEY",\n)\n\nstream = client.chat.completions.create(\n    model="amazon-fast",\n    messages=[\n        {"role": "user", "content": "你好"}\n    ],\n    stream=True,\n)\nfor chunk in stream:\n    print(chunk.choices[0].delta.content or "", end="")`,
+    curl: `curl ${baseURL}/chat/completions \\\n  -H "Authorization: Bearer YOUR_QUICKPOOL_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{\n    "model": "amazon-fast",\n    "messages": [{\n      "role": "user",\n      "content": "你好"\n    }],\n    "stream": true\n  }'`};
   text('#code-example', examples[state.code]);
 }
 async function loadLogs() {

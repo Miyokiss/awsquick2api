@@ -12,7 +12,7 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet
 
-from .models import AccountCreate, account_number
+from .models import DEFAULT_MODEL, AccountCreate, account_number
 
 
 class Store:
@@ -163,7 +163,7 @@ class Store:
         with self.lock, self.db:
             self.db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
 
-    def log(self, request_id, account_id, status, duration_ms, output_chars, error="", *, model='amazon-quick'):
+    def log(self, request_id, account_id, status, duration_ms, output_chars, error="", *, model=DEFAULT_MODEL):
         with self.lock, self.db:
             self.db.execute("INSERT INTO requests VALUES(?,?,?,?,?,?,?,?)",
                             (request_id, time.time(), account_id, model, status,
