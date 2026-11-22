@@ -11,7 +11,7 @@ Amazon Quick 原生桌面 OAuth、多账号池与 OpenAI Chat Completions、Resp
 ```powershell
 git clone https://github.com/avilliai/awsquick2api.git
 cd .\awsquick2api
-.\start.cmd
+.\start.ps1
 ```
 记事本打开 ` data/admin.key` 获取控制台管理密钥   
 
