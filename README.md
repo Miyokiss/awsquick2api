@@ -4,60 +4,9 @@ Amazon Quick 原生桌面 OAuth、多账号池与 OpenAI Chat Completions、Resp
 
 协议核对版本为官方桌面客户端 **1.2.4660**。本项目与 Amazon / AWS 无隶属关系；请使用自己有权使用的账号，并遵守服务规则与配额。
 
-## 快速启动
-
-### Windows：先启动，再打开控制台
-
-1. 安装 **Python 3.11 或更高版本**。安装时勾选 **Add python.exe to PATH**；如果刚安装完 Python，请关闭并重新打开终端。
-2. 打开项目文件夹，确认里面有 `README.md` 和 `start.cmd`。
-3. **双击 `start.cmd`**。也可以在该文件夹右键选择“在终端中打开”，复制执行：
-
-   ```powershell
-   .\start.cmd
-   ```
-
-   PowerShell 中前面的 `.\` 必须保留，不能只输入 `start.cmd` 或 `start.ps1`。
-
-4. 第一次会自动创建 `.venv` 并下载依赖，可能需要几分钟。看到下面这行才表示启动成功：
-
-   ```text
-   Uvicorn running on http://127.0.0.1:8045
-   ```
-
-5. 保持启动窗口打开，在浏览器访问 **http://127.0.0.1:8045/**。
-6. 控制台要求“管理密钥”时，在项目文件夹再开一个 PowerShell 窗口，执行：
-
-   ```powershell
-   Get-Content .\data\admin.key
-   ```
-
-   复制输出的一整行，粘贴到控制台后进入。这个文件在服务首次启动时自动生成，管理密钥不是你的 Amazon 密码。
-7. 在控制台进入“账号池”→“添加账号”，再按下方“原生账号授权”完成登录。
-
-以后仍然双击 `start.cmd` 或执行 `.\start.cmd`，已有账号保存在 `data` 目录。按 **Ctrl+C** 停止服务。
-
-`start.cmd` 会在单独的 PowerShell 进程中使用临时 `Bypass` 启动，不需要你修改系统的永久执行策略，也不需要管理员权限。启动失败会保留错误窗口。
-
-**如果你已经克隆了仓库，但没有 `start.cmd`**，先在项目文件夹执行 `git pull --ff-only`。若只是需要启动旧版本的 `start.ps1`，完整命令是：
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
-```
-
-常见问题按报错处理：
-
-- **“无法将 start.ps1 识别为命令”**：没有写 `.\`。直接使用上面的 `.\start.cmd`。
-- **“在此系统上禁止运行脚本”**：使用 `.\start.cmd`，或复制上面的完整 `powershell.exe` 命令；不要再直接运行 `.\start.ps1`。
-- **找不到 Python**：安装 Python 3.11+ 并勾选 PATH，然后重新打开终端。启动器也支持已安装的 `py.exe` Python Launcher。
-- **依赖下载失败**：启动窗口中会保留 pip 的具体错误。先确认当前网络可以访问你配置的 Python 包源，再重试 `.\start.cmd`。
-- **端口 8045 被占用 / WinError 10048**：在 PowerShell 依次执行 `$env:QUICKPOOL_PORT = "8047"` 和 `.\start.cmd`，然后访问 `http://127.0.0.1:8047/`。
-- **找不到 `data/admin.key`**：先确认服务已成功启动，并查看启动窗口打印的 `Console admin key file` 路径；配置了 `QUICKPOOL_DATA_DIR` 时，文件不在默认 `data` 目录。
-
-管理密钥只用于进入控制台。给 OpenAI / Codex / Claude 客户端填写的 API Key 另存在 `data/api.key`，两者不能混用。控制台默认脱敏，主动显示或复制时才读取 API Key。
-
-### 首次获取代码（尚未下载项目时）
-
-安装好 Git 和 Python 后，在你希望存放项目的目录打开 PowerShell：
+## 快速启动   
+### windows   
+安装好 Git 和 Python(3.11+) 后，在你希望存放项目的目录打开 PowerShell：
 
 ```powershell
 git clone https://github.com/avilliai/awsquick2api.git
@@ -107,9 +56,7 @@ access / refresh token 使用本机 Fernet 密钥加密持久化。服务提前�
 - `amazon-balanced`、`amazon-balanced-low`、`amazon-balanced-medium`、`amazon-balanced-high`
 - `amazon-smart`、`amazon-smart-low`、`amazon-smart-medium`、`amazon-smart-high`
 
-无后缀为 `off`；后缀对应 `low / medium / high`。短名 `fast / balanced / smart` 及其深度后缀也是明确别名。未知模型名直接报错，不自动回退。旧的 `amazon-quick*`、`amazon-balance*`、`quick*`、`balance*` 名称不再接受，请更新客户端配置。
-
-模型名直接使用上游的 `fast / balanced / smart`，模式名称不做转换，通过官方 `agent_mode`、`thinking_effort` 字段发送；显式 `agent_mode` 也只接受这三个上游值。它们是 Quick 的路由模式，不是任意指定底层 Claude 等模型。也支持标准 `reasoning_effort`，以及 `agent_mode` / `thinking_effort` 扩展字段；显式字段优先于名称后缀，默认为关闭思考。
+无后缀为思维链 `off`；后缀对应思考深度 `low / medium / high`。
 
 **fast 限制：**官方此版本的固定能力逻辑会把 fast 的思考深度归为 off。代理保留并透传所选后缀，12 个组合均已取得真实聊天回复，但 HTTP 200 不能证明 fast 开启了思考；最终能力取决于账号配置与 AWS 服务。需要思考时优先使用 balanced/smart 后缀。
 
