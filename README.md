@@ -13,6 +13,7 @@ git clone https://github.com/avilliai/awsquick2api.git
 cd .\awsquick2api
 .\start.cmd
 ```
+记事本打开 ` data/admin.key` 获取控制台管理密钥   
 
 ### Linux / macOS
 
