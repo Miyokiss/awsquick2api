@@ -6,29 +6,82 @@ Amazon Quick 原生桌面 OAuth、多账号池与 OpenAI Chat Completions、Resp
 
 ## 快速启动
 
-Python 3.11+。Windows：
+### Windows：先启动，再打开控制台
+
+1. 安装 **Python 3.11 或更高版本**。安装时勾选 **Add python.exe to PATH**；如果刚安装完 Python，请关闭并重新打开终端。
+2. 打开项目文件夹，确认里面有 `README.md` 和 `start.cmd`。
+3. **双击 `start.cmd`**。也可以在该文件夹右键选择“在终端中打开”，复制执行：
+
+   ```powershell
+   .\start.cmd
+   ```
+
+   PowerShell 中前面的 `.\` 必须保留，不能只输入 `start.cmd` 或 `start.ps1`。
+
+4. 第一次会自动创建 `.venv` 并下载依赖，可能需要几分钟。看到下面这行才表示启动成功：
+
+   ```text
+   Uvicorn running on http://127.0.0.1:8045
+   ```
+
+5. 保持启动窗口打开，在浏览器访问 **http://127.0.0.1:8045/**。
+6. 控制台要求“管理密钥”时，在项目文件夹再开一个 PowerShell 窗口，执行：
+
+   ```powershell
+   Get-Content .\data\admin.key
+   ```
+
+   复制输出的一整行，粘贴到控制台后进入。这个文件在服务首次启动时自动生成，管理密钥不是你的 Amazon 密码。
+7. 在控制台进入“账号池”→“添加账号”，再按下方“原生账号授权”完成登录。
+
+以后仍然双击 `start.cmd` 或执行 `.\start.cmd`，已有账号保存在 `data` 目录。按 **Ctrl+C** 停止服务。
+
+`start.cmd` 会在单独的 PowerShell 进程中使用临时 `Bypass` 启动，不需要你修改系统的永久执行策略，也不需要管理员权限。启动失败会保留错误窗口。
+
+**如果你已经克隆了仓库，但没有 `start.cmd`**，先在项目文件夹执行 `git pull --ff-only`。若只是需要启动旧版本的 `start.ps1`，完整命令是：
 
 ```powershell
-.\start.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
 ```
 
-Linux / macOS：
+常见问题按报错处理：
+
+- **“无法将 start.ps1 识别为命令”**：没有写 `.\`。直接使用上面的 `.\start.cmd`。
+- **“在此系统上禁止运行脚本”**：使用 `.\start.cmd`，或复制上面的完整 `powershell.exe` 命令；不要再直接运行 `.\start.ps1`。
+- **找不到 Python**：安装 Python 3.11+ 并勾选 PATH，然后重新打开终端。启动器也支持已安装的 `py.exe` Python Launcher。
+- **依赖下载失败**：启动窗口中会保留 pip 的具体错误。先确认当前网络可以访问你配置的 Python 包源，再重试 `.\start.cmd`。
+- **端口 8045 被占用 / WinError 10048**：在 PowerShell 依次执行 `$env:QUICKPOOL_PORT = "8047"` 和 `.\start.cmd`，然后访问 `http://127.0.0.1:8047/`。
+- **找不到 `data/admin.key`**：先确认服务已成功启动，并查看启动窗口打印的 `Console admin key file` 路径；配置了 `QUICKPOOL_DATA_DIR` 时，文件不在默认 `data` 目录。
+
+管理密钥只用于进入控制台。给 OpenAI / Codex / Claude 客户端填写的 API Key 另存在 `data/api.key`，两者不能混用。控制台默认脱敏，主动显示或复制时才读取 API Key。
+
+### 首次获取代码（尚未下载项目时）
+
+安装好 Git 和 Python 后，在你希望存放项目的目录打开 PowerShell：
+
+```powershell
+git clone https://github.com/avilliai/awsquick2api.git
+cd .\awsquick2api
+.\start.cmd
+```
+
+### Linux / macOS
+
+在项目目录安装 Python 3.11+ 后执行：
 
 ```sh
 sh start.sh
 ```
 
-或手动安装：
+也可以手动安装，无需激活虚拟环境：
 
 ```sh
-python -m venv .venv
-# Windows: .venv\Scripts\activate
-. .venv/bin/activate
-python -m pip install -e .
-python -m quickpool
+python3 -m venv .venv
+./.venv/bin/python -m pip install -e .
+./.venv/bin/python -m quickpool
 ```
 
-打开 `http://127.0.0.1:8045`，输入 `data/admin.key` 中的管理密钥。客户端 API Key 独立保存在 `data/api.key`；控制台默认脱敏，只有主动显示、复制或发送测试时才获取真实值。普通 `/api/config` 不返回明文 Key。
+服务启动后打开 `http://127.0.0.1:8045/`。在另一个终端执行 `cat data/admin.key` 获取控制台管理密钥。已有服务器实例的账号只在该服务器的数据目录内；本机另开一个实例不会自动同步账号。
 
 ## 原生账号授权
 
