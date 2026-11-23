@@ -21,6 +21,7 @@ jobs:
       - run: ruff check quickpool tests
       - run: node --check quickpool/static/app.js
       - run: node tests/test_admin_session.cjs
+      - run: node tests/test_key_visibility.cjs
       - name: Windows startup with restricted PowerShell and a fresh venv
         if: runner.os == 'Windows'
         run: python tests/windows_startup_smoke.py

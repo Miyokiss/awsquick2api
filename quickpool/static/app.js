@@ -10,13 +10,41 @@ let toastTimer;
 function text(selector, value) { $(selector).textContent = String(value); }
 function escapeHTML(value) { return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[ch])); }
 function toast(message) { text('#toast', message); $('#toast').hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => { $('#toast').hidden = true; }, 4000); }
-async function copy(value) { try { await navigator.clipboard.writeText(value); toast('已复制'); } catch { toast('剪贴板不可用，请手动复制'); } }
+function showCopyDialog(value, title = '复制内容', manual = false) {
+  text('#copy-dialog-title', title);
+  $('#copy-value').value = value;
+  text('#copy-dialog-status', manual ? '浏览器无法自动复制，完整内容已选中，请按 Ctrl+C（Mac：⌘C），或长按复制。' : '可直接复制，也可以选中下方完整内容手动复制。');
+  if (!$('#copy-dialog').open) $('#copy-dialog').showModal();
+  $('#copy-value').focus(); $('#copy-value').select();
+}
+function clearCopyDialog() {
+  $('#copy-value').value = ''; text('#copy-dialog-title', '复制内容'); text('#copy-dialog-status', '');
+}
+function closeCopyDialog() { if ($('#copy-dialog').open) $('#copy-dialog').close(); clearCopyDialog(); }
+async function copy(value, title = '复制内容') {
+  const admin = state.admin;
+  try {
+    await navigator.clipboard.writeText(value);
+    if (admin !== state.admin) return;
+    toast('已复制');
+    if ($('#copy-dialog').open && $('#copy-value').value === value) text('#copy-dialog-status', '已复制，可粘贴到客户端。');
+  } catch {
+    if (admin !== state.admin) return;
+    showCopyDialog(value, title, true);
+  }
+}
+async function useApiKey(id, reveal = false) {
+  const admin = state.admin; const value = await apiKey(id);
+  if (!admin || state.admin !== admin || !state.apiKeys.some(key => key.id === id && key.enabled)) return;
+  const title = 'API Key · ' + state.apiKeys.find(key => key.id === id).name;
+  if (reveal) showCopyDialog(value, title); else await copy(value, title);
+}
 async function api(path, options = {}) {
   const response = await fetch(path, {...options, headers: {'Authorization': 'Bearer ' + state.admin,
     ...(options.body ? {'Content-Type': 'application/json'} : {}), ...options.headers}});
   if (response.status === 204) return null;
   const result = await response.json();
-  if (response.status === 401 && result.detail === '管理密钥无效') { sessionStorage.removeItem('quickpool-admin'); state.admin = ''; stopAuthPolling(); if ($('#login-dialog').open) $('#login-dialog').close(); showAuth(); throw Error('管理密钥无效，请重新登录'); }
+  if (response.status === 401 && result.detail === '管理密钥无效') { sessionStorage.removeItem('quickpool-admin'); state.admin = ''; closeCopyDialog(); stopAuthPolling(); if ($('#login-dialog').open) $('#login-dialog').close(); showAuth(); throw Error('管理密钥无效，请重新登录'); }
   if (!response.ok) throw Error(typeof result.detail === 'string' ? result.detail : result.error?.message || '操作失败 (' + response.status + ')');
   return result;
 }
@@ -121,7 +149,7 @@ async function loadApiKeys(preferredId) {
   $('#api-key-select').value = state.selectedKeyId;
   $('#api-key-select').disabled = !active.length;
   text('#api-key-count', active.length + ' 个可用 / ' + result.keys.length + ' 个密钥');
-  $('#api-keys-body').innerHTML = result.keys.map(key => `<tr><td class="key-name">${escapeHTML(key.name)}${key.is_default ? '<span class="secondary">兼容已有客户端</span>' : ''}</td><td class="mono">${escapeHTML(key.masked)}</td><td><span class="status ${key.enabled ? 'ready' : 'disabled'}">${key.enabled ? '可用' : '已撤销'}</span></td><td>${escapeHTML(new Date(key.created_at*1000).toLocaleString('zh-CN'))}</td><td>${key.last_used ? escapeHTML(new Date(key.last_used*1000).toLocaleString('zh-CN')) : '尚未使用'}</td><td><div class="account-actions">${key.enabled ? `<button data-key-action="select" data-id="${escapeHTML(key.id)}">使用</button><button data-key-action="copy" data-id="${escapeHTML(key.id)}">复制</button><button class="danger" data-key-action="revoke" data-id="${escapeHTML(key.id)}">撤销</button>` : '—'}</div></td></tr>`).join('');
+  $('#api-keys-body').innerHTML = result.keys.map(key => `<tr><td class="key-name">${escapeHTML(key.name)}${key.is_default ? '<span class="secondary">兼容已有客户端</span>' : ''}${key.enabled ? `<button type="button" class="text-button key-view" data-key-action="view" data-id="${escapeHTML(key.id)}">查看完整密钥</button>` : ''}</td><td class="mono">${escapeHTML(key.masked)}</td><td><span class="status ${key.enabled ? 'ready' : 'disabled'}">${key.enabled ? '可用' : '已撤销'}</span></td><td>${escapeHTML(new Date(key.created_at*1000).toLocaleString('zh-CN'))}</td><td>${key.last_used ? escapeHTML(new Date(key.last_used*1000).toLocaleString('zh-CN')) : '尚未使用'}</td><td><div class="account-actions">${key.enabled ? `<button data-key-action="select" data-id="${escapeHTML(key.id)}">使用</button><button data-key-action="copy" data-id="${escapeHTML(key.id)}">复制</button><button class="danger" data-key-action="revoke" data-id="${escapeHTML(key.id)}">撤销</button>` : '—'}</div></td></tr>`).join('');
   renderCode();
 }
 async function apiKey(keyId = state.selectedKeyId) {
@@ -268,7 +296,7 @@ $('#auth-form').addEventListener('submit', async event => {
   } catch (error) { text('#auth-error', error.message); }
   finally { button.disabled = false; }
 });
-$('#logout').addEventListener('click', () => { stopAuthPolling(); if ($('#login-dialog').open) $('#login-dialog').close(); sessionStorage.removeItem('quickpool-admin'); state.admin = ''; state.config = null; state.keyVisible = false; state.apiKeys = []; state.selectedKeyId = ''; state.accounts = []; $('#api-keys-body').replaceChildren(); $('#api-key-select').replaceChildren(); text('#api-key-count', ''); renderAccounts(); renderCode(); showAuth(); });
+$('#logout').addEventListener('click', () => { closeCopyDialog(); stopAuthPolling(); if ($('#login-dialog').open) $('#login-dialog').close(); sessionStorage.removeItem('quickpool-admin'); state.admin = ''; state.config = null; state.keyVisible = false; state.apiKeys = []; state.selectedKeyId = ''; state.accounts = []; $('#api-keys-body').replaceChildren(); $('#api-key-select').replaceChildren(); text('#api-key-count', ''); renderAccounts(); renderCode(); showAuth(); });
 $('#refresh').addEventListener('click', refresh);
 $('#add-account').addEventListener('click', () => { $('#account-dialog').showModal(); $('#account-name').focus(); });
 $('#account-search').addEventListener('input', renderAccounts);
@@ -318,17 +346,22 @@ $('#copy-authorization-url').addEventListener('click', () => state.authorization
 $('#authorization-test').addEventListener('click', event => accountAction('test', state.authAccountId, event.currentTarget));
 $('#copy-endpoint').addEventListener('click', () => copy(baseURL));
 $('#copy-config-url').addEventListener('click', () => copy(baseURL));
-$('#copy-key').addEventListener('click', async () => { try { await copy(await apiKey()); } catch(error) { toast(error.message); } });
+$('#copy-key').addEventListener('click', async () => { try { await useApiKey(state.selectedKeyId); } catch(error) { toast(error.message); } });
+$('#copy-dialog').addEventListener('close', clearCopyDialog);
+$('#copy-dialog-copy').addEventListener('click', () => copy($('#copy-value').value, $('#copy-dialog-title').textContent));
+$('#copy-value').addEventListener('click', event => event.currentTarget.select());
 $('#api-key-select').addEventListener('change', () => {
   state.selectedKeyId = $('#api-key-select').value; state.keyVisible = false; renderCode();
 });
 $('#create-api-key-form').addEventListener('submit', async event => {
   event.preventDefault(); const button = event.submitter; button.disabled = true; text('#api-key-error', '');
+  const admin = state.admin;
   try {
     const result = await api('/api/keys', {method:'POST', body:JSON.stringify({name:$('#api-key-name').value.trim()})});
-    $('#api-key-name').value = ''; await loadApiKeys(result.id);
-    if (state.admin && state.selectedKeyId === result.id) { state.keyVisible = true; text('#config-key', result.api_key); renderCode(); }
-    toast('密钥已创建，已选中显示，可直接复制到客户端');
+    if (!admin || state.admin !== admin) return;
+    $('#api-key-name').value = '';
+    showCopyDialog(result.api_key, '密钥已创建 · ' + result.name);
+    await loadApiKeys(result.id);
   } catch(error) { text('#api-key-error', error.message); }
   finally { button.disabled = false; }
 });
@@ -344,7 +377,7 @@ $('#api-keys-body').addEventListener('click', async event => {
   if (keyAction === 'revoke' && !confirm('撤销此 API Key？使用它的客户端将立即无法发起新请求，其他密钥不受影响。')) return;
   button.disabled = true;
   try {
-    if (keyAction === 'copy') await copy(await apiKey(id));
+    if (keyAction === 'view' || keyAction === 'copy') await useApiKey(id, keyAction === 'view');
     if (keyAction === 'revoke') { await api(`/api/keys/${encodeURIComponent(id)}`, {method:'DELETE'}); await loadApiKeys(); toast('密钥已撤销'); }
   } catch(error) { toast(error.message); }
   finally { button.disabled = false; }

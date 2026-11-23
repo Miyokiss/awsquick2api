@@ -54,6 +54,12 @@
     </main>
   </div>
 
+  <dialog id="copy-dialog" aria-labelledby="copy-dialog-title" aria-describedby="copy-dialog-status">
+    <div class="dialog-heading"><h2 id="copy-dialog-title">完整 API Key</h2><button type="button" class="icon-button" data-close="copy-dialog" aria-label="关闭密钥弹窗">×</button></div>
+    <label for="copy-value">完整内容</label><textarea id="copy-value" class="json-editor" rows="4" readonly spellcheck="false" autocomplete="off"></textarea>
+    <p id="copy-dialog-status" class="muted" role="status" aria-live="polite"></p>
+    <div class="dialog-footer"><button type="button" class="button" data-close="copy-dialog">关闭</button><button type="button" class="button primary" id="copy-dialog-copy">复制完整内容</button></div>
+  </dialog>
   <dialog id="auth-dialog" class="auth-dialog"><form id="auth-form"><span class="brand-icon">q<span>↗</span></span><div class="eyebrow">QUICKPOOL CONSOLE</div><h2>连接你的本地网关</h2><p>输入管理密钥以访问账号池。首次启动后，密钥保存在服务数据目录的 <code>admin.key</code> 中。</p><label for="admin-key">管理密钥</label><input type="password" id="admin-key" autocomplete="current-password" required placeholder="粘贴 admin.key 中的密钥"><p id="auth-error" class="form-error" aria-live="polite"></p><button class="button primary full-width" type="submit">进入管理控制台 ↗</button><div class="auth-footer"><i class="status-dot green"></i> 凭据仅发送至当前本地服务</div></form></dialog>
   <dialog id="account-dialog"><form id="account-form"><div class="dialog-heading"><h2>添加 Quick 账号</h2><button type="button" class="icon-button" data-close="account-dialog" aria-label="关闭">×</button></div><p class="muted">每个账号独立保存原生授权与刷新令牌。</p><label for="account-name">账号名称</label><input id="account-name" placeholder="例如：工作账号" required maxlength="80"><label for="login-url">Quick 工作区地址</label><input id="login-url" type="url" value="https://quick.aws.com/sn" required><div class="form-columns"><div><label for="account-weight">调度权重</label><input id="account-weight" type="number" min="1" max="100" value="1" required></div><div><label for="account-concurrency">最大并发</label><input id="account-concurrency" type="number" min="1" max="8" value="1" required></div></div><p class="form-error" id="account-error" aria-live="polite"></p><div class="dialog-footer"><button type="button" class="button" data-close="account-dialog">取消</button><button class="button primary" type="submit">创建账号 ↗</button></div></form></dialog>
   <dialog id="login-dialog" aria-labelledby="login-title">
