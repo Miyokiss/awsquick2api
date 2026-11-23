@@ -42,6 +42,11 @@ class TransferRequest(BaseModel):
     bundle: dict | None = None
 
 
+class ApiKeyCreate(BaseModel):
+    model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
+    name: str = Field(min_length=1, max_length=80)
+
+
 def create_app(data_dir: Path | None = None, transport=None, ws_connect=None):
     @asynccontextmanager
     async def lifespan(app):
@@ -100,7 +105,7 @@ def create_app(data_dir: Path | None = None, transport=None, ws_connect=None):
         if request.url.path in ('/messages', '/v1/messages', '/messages/count_tokens', '/v1/messages/count_tokens'):
             token = token or request.headers.get('x-api-key', '')
         store = request.app.state.store
-        if not hmac.compare_digest(token.encode(), store.api_key.encode()):
+        if not store.authenticate_api_key(token):
             raise HTTPException(401, "API 密钥无效")
 
     def get_account(account_id):
@@ -129,7 +134,33 @@ def create_app(data_dir: Path | None = None, transport=None, ws_connect=None):
 
     @app.post('/api/config/reveal-key', dependencies=[Depends(admin)])
     async def reveal_key():
-        return {'api_key': app.state.store.api_key}
+        value = app.state.store.reveal_api_key('default')
+        if value is None:
+            raise HTTPException(404, '默认密钥已撤销，请在 API 接入页面创建新密钥')
+        return {'api_key': value}
+
+    @app.get('/api/keys', dependencies=[Depends(admin)])
+    async def list_api_keys():
+        return {'keys': app.state.store.api_keys()}
+
+    @app.post('/api/keys', dependencies=[Depends(admin)], status_code=201)
+    async def create_api_key(value: ApiKeyCreate):
+        try:
+            return app.state.store.create_api_key(value.name)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+
+    @app.post('/api/keys/{key_id}/reveal', dependencies=[Depends(admin)])
+    async def reveal_api_key(key_id: str):
+        value = app.state.store.reveal_api_key(key_id)
+        if value is None:
+            raise HTTPException(404, '密钥不存在或已撤销')
+        return {'api_key': value}
+
+    @app.delete('/api/keys/{key_id}', dependencies=[Depends(admin)], status_code=204)
+    async def revoke_api_key(key_id: str):
+        if not app.state.store.revoke_api_key(key_id):
+            raise HTTPException(404, '密钥不存在')
 
     @app.post("/api/accounts", dependencies=[Depends(admin)], status_code=201)
     async def add_account(account: AccountCreate):

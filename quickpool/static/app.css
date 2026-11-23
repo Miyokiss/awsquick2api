@@ -9,3 +9,6 @@
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 
 .model-select{display:block;width:100%;padding:12px;margin:8px 0 16px;background:var(--bg,#141614);color:inherit;border:1px solid #343934;border-radius:8px;font:inherit}.model-names code{white-space:normal;line-height:1.8}.filter-bar{flex-wrap:wrap}
+
+.api-key-panel{padding:24px;margin:22px 0}.api-key-panel h2{margin:0}.api-key-panel>p{line-height:1.7;font-size:12px}.api-key-create{display:flex;gap:10px;max-width:620px;margin:18px 0 8px}.api-key-create input{min-width:0;flex:1;margin:0}.api-key-panel .table-wrap{margin:14px -24px -24px;width:calc(100% + 48px);border-radius:0 0 9px 9px}.key-name{min-width:140px;max-width:260px;overflow-wrap:anywhere}.config-panel #api-key-select{width:100%;margin-bottom:10px}.copy-field code{overflow-wrap:anywhere;min-width:0}
+@media(max-width:600px){.api-key-create{flex-direction:column}.api-key-create .button{align-self:flex-start}.api-key-panel{padding:18px}.api-key-panel .table-wrap{margin:14px -18px -18px;width:calc(100% + 36px)}}

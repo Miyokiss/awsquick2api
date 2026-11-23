@@ -2,7 +2,7 @@
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const state = {admin: sessionStorage.getItem('quickpool-admin') || '', config: null, accounts: [], page: 'overview',
-  code: 'python', keyVisible: false, refreshing: false, authAccountId: null, authorizationUrl: '',
+  code: 'python', keyVisible: false, apiKeys: [], selectedKeyId: '', keyLoadGeneration: 0, refreshing: false, authAccountId: null, authorizationUrl: '',
   authGeneration: 0, authTimer: null, authStatus: 'none', authStarting: false, quotaRefreshing: false};
 const baseURL = location.origin + '/v1';
 let toastTimer;
@@ -32,6 +32,7 @@ function changePage(page) {
   $$('.nav-item').forEach(el => el.classList.toggle('selected', el.dataset.page === page));
   text('#breadcrumb', labels[page][0]); text('#page-title', labels[page][1]); text('#page-description', labels[page][2]);
   if (page === 'logs') loadLogs().catch(error => toast(error.message));
+  if (page === 'connect' && state.admin) loadApiKeys().catch(error => toast(error.message));
 }
 function quotaSummary(quota) {
   if (quota?.status !== 'available') return `<span class="muted" title="${escapeHTML(quota?.reason || '尚未刷新')}">暂不可用</span>`;
@@ -104,12 +105,35 @@ async function loadConfig() {
   state.config = await api('/api/config');
   const options = state.config.models || ['amazon-fast'];
   $('#playground-model').replaceChildren(...options.map(id => { const option = document.createElement('option'); option.value = id; option.textContent = id; return option; }));
+  await loadApiKeys();
+}
+async function loadApiKeys(preferredId) {
+  const admin = state.admin; const generation = ++state.keyLoadGeneration;
+  const result = await api('/api/keys');
+  if (!admin || state.admin !== admin || generation !== state.keyLoadGeneration) return;
+  state.apiKeys = result.keys;
+  const active = result.keys.filter(key => key.enabled);
+  state.selectedKeyId = active.find(key => key.id === (preferredId || state.selectedKeyId))?.id || active[0]?.id || '';
+  state.keyVisible = false;
+  $('#api-key-select').replaceChildren(...(active.length ? active.map(key => {
+    const option = document.createElement('option'); option.value = key.id; option.textContent = key.name; return option;
+  }) : [Object.assign(document.createElement('option'), {value:'', textContent:'请先创建 API Key'})]));
+  $('#api-key-select').value = state.selectedKeyId;
+  $('#api-key-select').disabled = !active.length;
+  text('#api-key-count', active.length + ' 个可用 / ' + result.keys.length + ' 个密钥');
+  $('#api-keys-body').innerHTML = result.keys.map(key => `<tr><td class="key-name">${escapeHTML(key.name)}${key.is_default ? '<span class="secondary">兼容已有客户端</span>' : ''}</td><td class="mono">${escapeHTML(key.masked)}</td><td><span class="status ${key.enabled ? 'ready' : 'disabled'}">${key.enabled ? '可用' : '已撤销'}</span></td><td>${escapeHTML(new Date(key.created_at*1000).toLocaleString('zh-CN'))}</td><td>${key.last_used ? escapeHTML(new Date(key.last_used*1000).toLocaleString('zh-CN')) : '尚未使用'}</td><td><div class="account-actions">${key.enabled ? `<button data-key-action="select" data-id="${escapeHTML(key.id)}">使用</button><button data-key-action="copy" data-id="${escapeHTML(key.id)}">复制</button><button class="danger" data-key-action="revoke" data-id="${escapeHTML(key.id)}">撤销</button>` : '—'}</div></td></tr>`).join('');
   renderCode();
 }
-async function apiKey() { return (await api('/api/config/reveal-key', {method:'POST'})).api_key; }
+async function apiKey(keyId = state.selectedKeyId) {
+  if (!keyId) throw Error('请先创建一个 API Key');
+  return (await api(`/api/keys/${encodeURIComponent(keyId)}/reveal`, {method:'POST'})).api_key;
+}
 function renderCode() {
   text('#endpoint-label', baseURL); text('#config-url', baseURL);
-  if (!state.keyVisible) text('#config-key', state.config?.api_key_masked || '••••••••••••••••••••••••');
+  const selected = state.apiKeys.find(key => key.id === state.selectedKeyId && key.enabled);
+  if (!state.keyVisible) text('#config-key', selected?.masked || '请先创建 API Key');
+  $('#copy-key').disabled = $('#reveal-key').disabled = !selected;
+  $('#reveal-key').setAttribute('aria-label', state.keyVisible ? '隐藏 API Key' : '显示 API Key');
   const examples = {
     python: `from openai import OpenAI\n\nclient = OpenAI(\n    base_url="${baseURL}",\n    api_key="YOUR_QUICKPOOL_API_KEY",\n)\n\nstream = client.chat.completions.create(\n    model="amazon-fast",\n    messages=[\n        {"role": "user", "content": "你好"}\n    ],\n    stream=True,\n)\nfor chunk in stream:\n    print(chunk.choices[0].delta.content or "", end="")`,
     curl: `curl ${baseURL}/chat/completions \\\n  -H "Authorization: Bearer YOUR_QUICKPOOL_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '{\n    "model": "amazon-fast",\n    "messages": [{\n      "role": "user",\n      "content": "你好"\n    }],\n    "stream": true\n  }'`};
@@ -244,7 +268,7 @@ $('#auth-form').addEventListener('submit', async event => {
   } catch (error) { text('#auth-error', error.message); }
   finally { button.disabled = false; }
 });
-$('#logout').addEventListener('click', () => { stopAuthPolling(); if ($('#login-dialog').open) $('#login-dialog').close(); sessionStorage.removeItem('quickpool-admin'); state.admin = ''; state.config = null; state.keyVisible = false; state.accounts = []; renderAccounts(); renderCode(); showAuth(); });
+$('#logout').addEventListener('click', () => { stopAuthPolling(); if ($('#login-dialog').open) $('#login-dialog').close(); sessionStorage.removeItem('quickpool-admin'); state.admin = ''; state.config = null; state.keyVisible = false; state.apiKeys = []; state.selectedKeyId = ''; state.accounts = []; $('#api-keys-body').replaceChildren(); $('#api-key-select').replaceChildren(); text('#api-key-count', ''); renderAccounts(); renderCode(); showAuth(); });
 $('#refresh').addEventListener('click', refresh);
 $('#add-account').addEventListener('click', () => { $('#account-dialog').showModal(); $('#account-name').focus(); });
 $('#account-search').addEventListener('input', renderAccounts);
@@ -295,11 +319,43 @@ $('#authorization-test').addEventListener('click', event => accountAction('test'
 $('#copy-endpoint').addEventListener('click', () => copy(baseURL));
 $('#copy-config-url').addEventListener('click', () => copy(baseURL));
 $('#copy-key').addEventListener('click', async () => { try { await copy(await apiKey()); } catch(error) { toast(error.message); } });
+$('#api-key-select').addEventListener('change', () => {
+  state.selectedKeyId = $('#api-key-select').value; state.keyVisible = false; renderCode();
+});
+$('#create-api-key-form').addEventListener('submit', async event => {
+  event.preventDefault(); const button = event.submitter; button.disabled = true; text('#api-key-error', '');
+  try {
+    const result = await api('/api/keys', {method:'POST', body:JSON.stringify({name:$('#api-key-name').value.trim()})});
+    $('#api-key-name').value = ''; await loadApiKeys(result.id);
+    if (state.admin && state.selectedKeyId === result.id) { state.keyVisible = true; text('#config-key', result.api_key); renderCode(); }
+    toast('密钥已创建，已选中显示，可直接复制到客户端');
+  } catch(error) { text('#api-key-error', error.message); }
+  finally { button.disabled = false; }
+});
+$('#refresh-api-keys').addEventListener('click', async event => {
+  const button = event.currentTarget; button.disabled = true;
+  try { await loadApiKeys(); } catch(error) { toast(error.message); }
+  finally { button.disabled = false; }
+});
+$('#api-keys-body').addEventListener('click', async event => {
+  const button = event.target.closest('[data-key-action]'); if (!button) return;
+  const {id, keyAction} = button.dataset;
+  if (keyAction === 'select') { state.selectedKeyId = id; $('#api-key-select').value = id; state.keyVisible = false; renderCode(); return; }
+  if (keyAction === 'revoke' && !confirm('撤销此 API Key？使用它的客户端将立即无法发起新请求，其他密钥不受影响。')) return;
+  button.disabled = true;
+  try {
+    if (keyAction === 'copy') await copy(await apiKey(id));
+    if (keyAction === 'revoke') { await api(`/api/keys/${encodeURIComponent(id)}`, {method:'DELETE'}); await loadApiKeys(); toast('密钥已撤销'); }
+  } catch(error) { toast(error.message); }
+  finally { button.disabled = false; }
+});
 $('#reveal-key').addEventListener('click', async () => {
   try {
-    state.keyVisible = !state.keyVisible;
-    if (state.keyVisible) text('#config-key', await apiKey());
-    $('#reveal-key').setAttribute('aria-label', state.keyVisible ? '隐藏 API Key' : '显示 API Key'); renderCode();
+    if (state.keyVisible) { state.keyVisible = false; renderCode(); return; }
+    const id = state.selectedKeyId; const admin = state.admin;
+    const value = await apiKey(id);
+    if (state.selectedKeyId !== id || !admin || state.admin !== admin) return;
+    state.keyVisible = true; text('#config-key', value); renderCode();
   } catch(error) { state.keyVisible = false; renderCode(); toast(error.message); }
 });
 $('#copy-example').addEventListener('click', () => copy($('#code-example').textContent));

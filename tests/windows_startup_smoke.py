@@ -23,6 +23,11 @@ def probe(source: Path, timeout: int = 360) -> dict:
     base = Path(tempfile.mkdtemp(prefix='quickpool windows startup '))
     project = base / 'project with spaces'
     project.mkdir()
+    # A real restart has an existing top-level data/ directory. It must not be
+    # mistaken for another Python package during the editable installation.
+    data = project / 'data'
+    data.mkdir()
+    (data / 'existing-state.txt').write_text('Existing runtime data must be preserved.')
     for name in ('pyproject.toml', 'README.md', 'LICENSE', 'start.ps1', 'start.cmd'):
         path = source / name
         if path.exists():
@@ -33,7 +38,7 @@ def probe(source: Path, timeout: int = 360) -> dict:
         port = sock.getsockname()[1]
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith('QUICKPOOL_')}
     env.update(QUICKPOOL_HOST='127.0.0.1', QUICKPOOL_PORT=str(port),
-               QUICKPOOL_DATA_DIR=str(base / 'isolated data'), PYTHONUNBUFFERED='1',
+               QUICKPOOL_DATA_DIR=str(data), PYTHONUNBUFFERED='1',
                PYTHONDONTWRITEBYTECODE='1', PIP_DISABLE_PIP_VERSION_CHECK='1')
     powershell = str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
     direct = [powershell, '-NoProfile', '-ExecutionPolicy', 'Restricted', '-Command',
@@ -65,7 +70,6 @@ def probe(source: Path, timeout: int = 360) -> dict:
                 except (OSError, urllib.error.URLError):
                     time.sleep(.25)
             if report['ready']:
-                data = base / 'isolated data'
                 admin = (data / 'admin.key').read_text().strip()
                 api = (data / 'api.key').read_text().strip()
                 assert admin and api and admin != api
@@ -75,6 +79,8 @@ def probe(source: Path, timeout: int = 360) -> dict:
                     report['account_count'] = len(json.load(response)['accounts'])
                 assert report['account_count'] == 0
                 report['separate_management_and_api_keys'] = True
+                assert (data / 'existing-state.txt').read_text() == 'Existing runtime data must be preserved.'
+                report['existing_data_directory_preserved'] = True
         finally:
             report['launcher_exit_before_cleanup'] = process.poll()
             if process.poll() is None:

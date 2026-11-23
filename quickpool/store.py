@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -48,6 +49,11 @@ class Store:
                 id INTEGER PRIMARY KEY, created_at REAL NOT NULL, account_id TEXT NOT NULL,
                 event TEXT NOT NULL, details TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT UNIQUE NOT NULL,
+                masked TEXT NOT NULL, secret BLOB NOT NULL, created_at REAL NOT NULL,
+                last_used REAL NOT NULL DEFAULT 0, revoked_at REAL NOT NULL DEFAULT 0
+            );
         """)
         self.db.commit()
         columns = {row[1] for row in self.db.execute('PRAGMA table_info(accounts)')}
@@ -62,6 +68,79 @@ class Store:
         # Cookie/template credentials must never silently become native accounts.
         self.db.execute("UPDATE accounts SET state='unconfigured' WHERE auth_type!='native'")
         self.db.commit()
+        # Register the existing file/env key without rotating it or reviving a revoked key.
+        digest = self._api_key_hash(self.api_key)
+        with self.lock, self.db:
+            self.db.execute(
+                "INSERT INTO api_keys(id,name,key_hash,masked,secret,created_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET key_hash=excluded.key_hash,masked=excluded.masked,"
+                "secret=excluded.secret,created_at=excluded.created_at,last_used=0,revoked_at=0 "
+                "WHERE api_keys.key_hash!=excluded.key_hash",
+                ('default', '默认密钥', digest, self._mask_api_key(self.api_key),
+                 self.cipher.encrypt(self.api_key.encode()), time.time()))
+
+    @staticmethod
+    def _api_key_hash(value):
+        return hashlib.sha256(value.encode()).hexdigest()
+
+    @staticmethod
+    def _mask_api_key(value):
+        return value[:12] + '••••••••' + value[-4:] if len(value) > 20 else '••••••••'
+
+    @staticmethod
+    def _public_api_key(row):
+        result = {name: row[name] for name in ('id', 'name', 'masked', 'created_at', 'last_used', 'revoked_at')}
+        result['enabled'] = not bool(result['revoked_at'])
+        result['is_default'] = result['id'] == 'default'
+        return result
+
+    def api_keys(self):
+        with self.lock:
+            return [self._public_api_key(row) for row in self.db.execute(
+                'SELECT * FROM api_keys ORDER BY created_at,id')]
+
+    def create_api_key(self, name):
+        name = name.strip()
+        if not 1 <= len(name) <= 80:
+            raise ValueError('密钥名称须为 1–80 个字符')
+        value = 'sk-quick-' + secrets.token_urlsafe(32)
+        key_id = str(uuid.uuid4())
+        with self.lock, self.db:
+            if self.db.execute('SELECT COUNT(*) FROM api_keys WHERE revoked_at=0').fetchone()[0] >= 100:
+                raise ValueError('最多同时启用 100 个 API 密钥，请先撤销不再使用的密钥')
+            self.db.execute(
+                'INSERT INTO api_keys(id,name,key_hash,masked,secret,created_at) VALUES(?,?,?,?,?,?)',
+                (key_id, name, self._api_key_hash(value), self._mask_api_key(value),
+                 self.cipher.encrypt(value.encode()), time.time()))
+            row = self.db.execute('SELECT * FROM api_keys WHERE id=?', (key_id,)).fetchone()
+        return self._public_api_key(row) | {'api_key': value}
+
+    def reveal_api_key(self, key_id):
+        with self.lock:
+            row = self.db.execute('SELECT secret FROM api_keys WHERE id=? AND revoked_at=0',
+                                  (key_id,)).fetchone()
+        return self.cipher.decrypt(row['secret']).decode() if row else None
+
+    def revoke_api_key(self, key_id):
+        with self.lock, self.db:
+            row = self.db.execute('SELECT revoked_at FROM api_keys WHERE id=?', (key_id,)).fetchone()
+            if row is None:
+                return False
+            if not row['revoked_at']:
+                self.db.execute('UPDATE api_keys SET revoked_at=?,secret=? WHERE id=?',
+                                (time.time(), b'', key_id))
+        return True
+
+    def authenticate_api_key(self, token):
+        if not token or len(token) > 512:
+            return False
+        with self.lock, self.db:
+            row = self.db.execute('SELECT id FROM api_keys WHERE key_hash=? AND revoked_at=0',
+                                  (self._api_key_hash(token),)).fetchone()
+            if row is None:
+                return False
+            self.db.execute('UPDATE api_keys SET last_used=? WHERE id=?', (time.time(), row['id']))
+        return True
 
     def _key_file(self, name, factory):
         path = self.directory / name

@@ -15,6 +15,9 @@ dev = ["pytest>=8", "pytest-asyncio>=0.25", "ruff>=0.9"]
 [project.scripts]
 awsquick2api = "quickpool.__main__:main"
 
+[tool.setuptools.packages.find]
+include = ["quickpool", "quickpool.*"]
+
 [tool.setuptools.package-data]
 quickpool = ["static/*"]
 

@@ -11,7 +11,7 @@ Amazon Quick 原生桌面 OAuth、多账号池与 OpenAI Chat Completions、Resp
 ```powershell
 git clone https://github.com/avilliai/awsquick2api.git
 cd .\awsquick2api
-.\start.ps1
+.\start.cmd
 ```
 记事本打开 ` data/admin.key` 获取控制台管理密钥   
 
@@ -32,6 +32,21 @@ python3 -m venv .venv
 ```
 
 服务启动后打开 `http://127.0.0.1:8045/`。在另一个终端执行 `cat data/admin.key` 获取控制台管理密钥。已有服务器实例的账号只在该服务器的数据目录内；本机另开一个实例不会自动同步账号。
+
+## API 密钥管理
+
+
+1. 登录控制台，进入 **“API 接入”**，找到 **“密钥管理”**。
+2. 填写名称（例如“Codex 笔记本”或“Claude 服务器”），点击 **“创建密钥”**。
+3. 页面会选中新密钥；点击 **“复制 API Key”** 按钮或列表中的 **“复制”**，填到对应客户端。
+4. 可以重复创建多个独立 Key。切换上方下拉框可查看、复制指定 Key，页面内的对话测试也使用当前选中的 Key。
+5. 不再使用时，点击该行 **“撤销”** 并确认。该 Key 随后的 API 请求立即返回 401，其他 Key 和已在进行的请求不受影响。撤销不可恢复，需要时创建新 Key。
+
+密钥列表显示名称、掩码、状态、创建时间和最近使用时间。完整密钥默认隐藏，只有管理员主动创建、显示或复制时才返回；新增密钥在数据库中加密保存，鉴权使用 SHA-256 摘要。刷新页面、重启服务后仍然保留，无需重新创建。所有 Key 共用同一账号池和配额，当前不单独设置用量上限。
+
+最多同时启用 100 个 Key。原来的默认 Key 也可以撤销；文件 `data/api.key` 仍保留原值，但原值重启后也不会自动恢复有效。只有显式更换该文件或 `QUICKPOOL_API_KEY` 的值才会重新启用默认 Key。新增 Key 不会改写这个文件。备份和迁移网关密钥时须同时保留 `quickpool.db` 和 `encryption.key`；“账号导出”不包含 API Key。
+
+管理接口均使用管理密钥：`GET /api/keys` 列表、`POST /api/keys` 创建（JSON 为 `{"name":"客户端名称"}`）、`POST /api/keys/{id}/reveal` 主动读取、`DELETE /api/keys/{id}` 撤销。API Key 无权调用这些管理接口。多个 Key 均支持 Chat Completions、Responses、Messages，以及 Messages 的 `x-api-key` 请求头。
 
 ## 原生账号授权
 
@@ -134,7 +149,7 @@ $env:CLAUDE_CODE_SUBAGENT_MODEL = "amazon-balanced"
 claude --model amazon-smart
 ```
 
-Linux/macOS 对应使用 `export NAME=value`。API Key 使用 `data/api.key`，不是管理密钥。未知 `gpt-*` / `claude-*` 名称仍报错，不自动替换模型。
+Linux/macOS 对应使用 `export NAME=value`。API Key 使用“API 接入”页面创建的密钥或原有 `data/api.key` 默认密钥，不是管理密钥。未知 `gpt-*` / `claude-*` 名称仍报错，不自动替换模型。
 
 **接口边界：**每次须发送完整历史；不存储可检索 Response，也不支持 previous_response_id、conversation、background 或 store=true。普通文本实时 SSE；工具输出先缓冲并校验 JSON，然后发送各协议的工具事件。Responses custom 工具映射成 `arguments.input` 字符串，不提供服务端 grammar 执行器。Messages thinking/output_config.effort 映射到 Quick 思考深度，不生成虚假的 thinking 内容；budget_tokens 以 8192/16384 为 medium/high 分界，其余为 low，不能承诺精确推理 token 预算。Anthropic 缓存提示不启用服务端提示缓存。内置 web_search/computer_use 等服务端工具、压缩会话、WebSocket Responses、音频和 PDF 等任意文件类型会被拒绝或没有路由。工具协议兼容不等于 AWS 原生函数调用或与原模型等价的编码能力。
 
