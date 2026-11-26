@@ -2,7 +2,7 @@
 
 Amazon Quick 原生桌面 OAuth、多账号池与 OpenAI Chat Completions、Responses / Anthropic Messages 兼容网关。参考 Antigravity-Manager 和 workbuddy2api-panel 的授权与调度思路，独立实现。运行时不依赖官方 exe，不读取官方客户端凭据库，不使用网页 Cookie、HAR 或浏览器配置。
 
-协议核对版本为官方桌面客户端 **1.2.4660**。本项目与 Amazon / AWS 无隶属关系；请使用自己有权使用的账号，并遵守服务规则与配额。
+基础协议核对版本为官方桌面客户端 **1.2.4660**；大上下文附件与发送预算另对照本机 **Amazon Quick.app 1.2.4757** 核对。本项目与 Amazon / AWS 无隶属关系；请使用自己有权使用的账号，并遵守服务规则与配额。
 
 ## 快速启动   
 ### windows   
@@ -11,7 +11,7 @@ Amazon Quick 原生桌面 OAuth、多账号池与 OpenAI Chat Completions、Resp
 ```powershell
 git clone https://github.com/avilliai/awsquick2api.git
 cd .\awsquick2api
-.\start.cmd
+.\start.ps1
 ```
 记事本打开 ` data/admin.key` 获取控制台管理密钥   
 
@@ -35,19 +35,9 @@ python3 -m venv .venv
 
 ## API 密钥管理
 
+打开控制台的「API 密钥」页面创建客户端密钥，可以按用户、账号分组、每日限额和到期时间配置。创建后立即显示完整密钥，剪贴板不可用时可以手动复制。支持再次显示的密钥会加密保存，仅管理员可以读取。
 
-1. 登录控制台，进入 **“API 接入”**，找到 **“密钥管理”**。
-2. 填写名称（例如“Codex 笔记本”或“Claude 服务器”），点击 **“创建密钥”**。
-3. 创建成功后会立即弹出**完整密钥**。点击“复制完整内容”，粘贴到客户端的 API Key 设置中。
-4. 已有密钥（包括默认密钥）可随时点击名称下方的 **“查看完整密钥”**，不必重新创建。浏览器不允许自动复制时，弹窗会显示并选中完整内容，直接按 **Ctrl+C**（Mac：**⌘C**）或长按复制。关闭弹窗后会清除弹窗内的明文。
-5. 可以重复创建多个独立 Key。上方下拉框用于选择接入配置与页面内对话测试使用的 Key。
-6. 不再使用时，点击该行 **“撤销”** 并确认。该 Key 随后的 API 请求立即返回 401，其他 Key 和已在进行的请求不受影响。撤销不可恢复，需要时创建新 Key。
-
-密钥列表显示名称、掩码、状态、创建时间和最近使用时间。完整密钥默认隐藏，只有管理员主动创建、显示或复制时才返回；新增密钥在数据库中加密保存，鉴权使用 SHA-256 摘要。刷新页面、重启服务后仍然保留，无需重新创建。所有 Key 共用同一账号池和配额，当前不单独设置用量上限。
-
-最多同时启用 100 个 Key。原来的默认 Key 也可以撤销；文件 `data/api.key` 仍保留原值，但原值重启后也不会自动恢复有效。只有显式更换该文件或 `QUICKPOOL_API_KEY` 的值才会重新启用默认 Key。新增 Key 不会改写这个文件。备份和迁移网关密钥时须同时保留 `quickpool.db` 和 `encryption.key`；“账号导出”不包含 API Key。
-
-管理接口均使用管理密钥：`GET /api/keys` 列表、`POST /api/keys` 创建（JSON 为 `{"name":"客户端名称"}`）、`POST /api/keys/{id}/reveal` 主动读取、`DELETE /api/keys/{id}` 撤销。API Key 无权调用这些管理接口。多个 Key 均支持 Chat Completions、Responses、Messages，以及 Messages 的 `x-api-key` 请求头。
+从已有 Dev 版本升级会保留密钥、加密材料及撤销状态。删除密钥会永久撤销，重复删除安全。主密钥被撤销后，要更换 `data/api.key` 或 `QUICKPOOL_API_KEY` 才能重新启用。迁移时应保留 `quickpool.db`、`encryption.key` 和原主密钥配置。
 
 ## 原生账号授权
 
@@ -95,13 +85,22 @@ for chunk in stream:
 
 ## 兼容范围
 
+每次请求最多 128 个工具，Responses namespace 内的工具按展开后的数量计算。管理员可设定更低的上限。
+
+请求日志和 CSV 的 `upstream_error_code` 字段记录已识别的上游错误码。无法识别的错误事件使用 `error_event`，错误帧使用 `error_frame`。
+
 - 文本非流式、实时 SSE；支持文本内容数组。
+- 连接保活按传输区分：个人 AIDP 跟随官方浏览器连接，不主动发送 WebSocket Ping（上游不回 Pong）；企业 Gateway 保留 Ping/Pong 检查。两者仍保留接收超时及单轮五分钟时限。
 - 多轮：每次新建 Quick 对话，将完整角色、历史和 tool call ID 序列化成上下文，不在账号间复用服务端 conversation。
+- 大上下文（个人 AIDP）：按实际编码后消息大小检查，超过 60,000 字节的安全预算时，将完整角色/历史/工具 Schema/选择约束转为 UTF-8 JSON 附件，走原生上传、DLP 与当前会话交付；不截断工具或长日志。小请求继续内联。请求体与转换后附件均限 5 MiB；这不是模型 token 上下文承诺。企业 Gateway 的超限请求明确返回 400，目前不复用 AIDP 附件实现。
+- 错误分类：`FrameTooLarge` 等请求错误返回 400，不换账号重试、不计账号失败；上游明确 `retryable:false` 时停止重试。格式/Schema 校验失败仍返回 502，但不冷却健康账号；真正的鉴权、限流与暂时服务错误保留原处理。
 - 图片：OpenAI `image_url` 的 PNG/JPEG base64 data URL，单图最多 3 MiB、最多 4 张、请求总计最多 5 MiB。通过官方上传、DLP、附件交付流程，不把图片 base64 当文本。WARN/BLOCK 不自动绕过。暂不下载远程图片 URL（防止 SSRF）；企业 Gateway 图片路径尚未实现。
 - `tools / tool_choice / parallel_tool_calls`，旧版 `functions / function_call`，以及 `role=tool` 的后续结果消息。
 - `response_format` 的 `json_object / json_schema`，验证 JSON Schema；不允许外部 `$ref`。
 
 **工具与 JSON 是提示词适配层，不是原生 Outpost/MCP 函数注册。**模型获得客户端函数定义并返回 JSON，网关验证函数名、参数和选择约束后才生成 OpenAI `tool_calls`，不会替客户端执行函数。工具与结构化响应先缓冲、验证，再返回非流式或标准 SSE；普通文本仍实时输出。模型不遵守格式会返回 502，不伪造成功。原生 MCP 注册机制已有研究，但尚未作为此兼容接口的实现。
+
+默认文本格式的工具回复允许“前置说明 + 单个完整工具 JSON”：说明保留为 assistant 文本，工具参数仍严格校验；歧义 JSON、尾随文字、未知函数和 Schema 错误继续拒绝。显式 JSON / JSON Schema 输出格式仍要求整段为 JSON。
 
 同时提供下面的 Responses / Messages 兼容接口。暂不提供音频、视频或任意文件协议；不保证所有参数均改变上游行为，例如 temperature/max_tokens 不对应此版本已核对的桌面字段。仅 `n=1`。Responses 的 usage 为 null；Messages 必需的数值 usage 与 count_tokens 使用本地 UTF-8 字节启发式估算，通过 `X-QuickPool-Usage: estimated` 标注，不是官方 tokenizer、真实计费或 AWS 剩余配额。
 
@@ -137,20 +136,15 @@ codex -m amazon-smart
 
 将模型改为 `amazon-smart-high` 等即可选择名称后缀；若同时配置 `model_reasoning_effort`，显式 effort 优先，需同步改成 `high` 或删除该行。
 
-Claude Code 使用根地址（不带 `/v1`），并将所需角色映射为 QuickPool 已公布的模型名：
+Claude Code 使用根地址（不带 `/v1`）。服务端接受 `opus`、`sonnet`、`haiku`，以及对应带数字版本、日期或 `-latest` 后缀的 `claude-*` 名称，分别映射到 `amazon-smart`、`amazon-balanced`、`amazon-fast`。切换供应商时仅需修改地址与 API Key，不必设置专用模型环境变量：
 
 ```powershell
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8045"
 $env:ANTHROPIC_API_KEY = "YOUR_QUICKPOOL_API_KEY"
-$env:ANTHROPIC_MODEL = "amazon-smart"
-$env:ANTHROPIC_DEFAULT_OPUS_MODEL = "amazon-smart-high"
-$env:ANTHROPIC_DEFAULT_SONNET_MODEL = "amazon-balanced"
-$env:ANTHROPIC_DEFAULT_HAIKU_MODEL = "amazon-fast"
-$env:CLAUDE_CODE_SUBAGENT_MODEL = "amazon-balanced"
-claude --model amazon-smart
+claude --model sonnet
 ```
 
-Linux/macOS 对应使用 `export NAME=value`。API Key 使用“API 接入”页面创建的密钥或原有 `data/api.key` 默认密钥，不是管理密钥。未知 `gpt-*` / `claude-*` 名称仍报错，不自动替换模型。
+Linux/macOS 对应使用 `export NAME=value`。API Key 使用「API 密钥」页面创建的客户端密钥或启用的主密钥。别名仅选择 Quick 档位，响应保留请求的模型名。原有 `amazon-*` 名称、显式思考强度及 `/v1/models` 的 12 项原生模型列表不变。未知模型名称会返回错误。
 
 **接口边界：**每次须发送完整历史；不存储可检索 Response，也不支持 previous_response_id、conversation、background 或 store=true。普通文本实时 SSE；工具输出先缓冲并校验 JSON，然后发送各协议的工具事件。Responses custom 工具映射成 `arguments.input` 字符串，不提供服务端 grammar 执行器。Messages thinking/output_config.effort 映射到 Quick 思考深度，不生成虚假的 thinking 内容；budget_tokens 以 8192/16384 为 medium/high 分界，其余为 low，不能承诺精确推理 token 预算。Anthropic 缓存提示不启用服务端提示缓存。内置 web_search/computer_use 等服务端工具、压缩会话、WebSocket Responses、音频和 PDF 等任意文件类型会被拒绝或没有路由。工具协议兼容不等于 AWS 原生函数调用或与原模型等价的编码能力。
 

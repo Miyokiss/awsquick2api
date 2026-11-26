@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
 from .compat import CompatibilityError
-from .models import ChatRequest
+from .models import MAX_TOOLS, ChatRequest
 
 
 def estimate_tokens(value):
@@ -31,8 +31,10 @@ def require(condition, message):
 
 
 class Tools:
-    def __init__(self, definitions, protocol):
-        require(isinstance(definitions, list) and len(definitions) <= 64, 'tools 必须是最多 64 项的数组')
+    def __init__(self, definitions, protocol, *, max_tools: int = MAX_TOOLS):
+        max_tools = min(max_tools, MAX_TOOLS)
+        require(isinstance(definitions, list) and len(definitions) <= max_tools,
+                f'tools 必须是最多 {max_tools} 项的数组')
         self.chat, self.entries = [], {}
         for tool in definitions:
             require(isinstance(tool, dict), '工具定义无效')
@@ -40,11 +42,13 @@ class Tools:
                 namespace = tool.get('name')
                 require(isinstance(namespace, str) and namespace, '工具 namespace 无效')
                 require(isinstance(tool.get('tools'), list), 'namespace.tools 必须是数组')
+                require(len(self.chat) + len(tool['tools']) <= max_tools,
+                        f'展开后工具数不得超过 {max_tools}')
                 for child in tool['tools']:
                     self.add(child, protocol, namespace)
             else:
                 self.add(tool, protocol)
-        require(len(self.chat) <= 64, '展开后工具数不得超过 64')
+        require(len(self.chat) <= max_tools, f'展开后工具数不得超过 {max_tools}')
 
     def add(self, tool, protocol, namespace=None):
         require(isinstance(tool, dict), '工具定义无效')
@@ -211,9 +215,9 @@ def anthropic_input(body):
     return messages
 
 
-def prepare(body, protocol):
+def prepare(body, protocol, *, max_tools: int = MAX_TOOLS):
     require(isinstance(body, dict), '请求体必须是 JSON 对象')
-    tools = Tools(body.get('tools', []), protocol)
+    tools = Tools(body.get('tools', []), protocol, max_tools=max_tools)
     extra = {k: body[k] for k in ('model', 'stream', 'parallel_tool_calls') if k in body}
     require(isinstance(body.get('stream', False), bool), 'stream 必须是布尔值')
     if protocol == 'responses':
@@ -244,11 +248,14 @@ def prepare(body, protocol):
         if thinking.get('type') == 'disabled':
             extra['thinking_effort'] = 'off'
         elif config.get('effort'):
-            extra['thinking_effort'] = {'max': 'high'}.get(config['effort'], config['effort'])
+            extra['thinking_effort'] = {'max': 'high', 'xhigh': 'high', 'none': 'off', 'minimal': 'low'}.get(
+                config['effort'], config['effort'])
         elif thinking.get('type') == 'enabled':
             budget = thinking.get('budget_tokens', 1024)
-            require(isinstance(budget, int) and budget > 0, 'thinking.budget_tokens 无效')
+            require(isinstance(budget, int) and not isinstance(budget, bool) and budget > 0, 'thinking.budget_tokens 无效')
             extra['thinking_effort'] = 'high' if budget >= 16384 else 'medium' if budget >= 8192 else 'low'
+        elif thinking.get('type') == 'adaptive':
+            extra['thinking_effort'] = 'medium'
         if config.get('format'):
             extra['response_format'] = {'type': 'json_schema', 'json_schema': config['format']}
         choice = body.get('tool_choice')
@@ -460,11 +467,13 @@ async def message_stream(result, request, tools, input_tokens):
 def register_cli_routes(app, complete, api_access):
     async def handle(request, protocol, count=False):
         try:
-            api_access(request)
+            await api_access(request)
             body = await request.json()
             if count and isinstance(body, dict):
                 body = {**body, 'max_tokens': body.get('max_tokens', 1), 'stream': False}
-            chat, tools = prepare(body, protocol)
+            store = getattr(request.app.state, 'store', None)
+            max_tools = store.get_settings().get('max_tools', MAX_TOOLS) if store else MAX_TOOLS
+            chat, tools = prepare(body, protocol, max_tools=max_tools)
         except HTTPException as error:
             return api_error(protocol, error.detail, error.status_code)
         except CompatibilityError as error:

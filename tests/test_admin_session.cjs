@@ -14,7 +14,8 @@ const api = source.slice(source.indexOf('async function api('), source.indexOf('
       state: {admin: 'FIXTURE_ADMIN'},
       fetch: async () => ({status: 401, ok: false, json: async () => ({detail})}),
       sessionStorage: {removeItem: () => {}},
-      closeCopyDialog: () => {}, stopAuthPolling: () => {}, $: () => ({open: false}), showAuth: () => {},
+      closeCopyDialog: () => {}, renderCode: () => {}, stopAuthPolling: () => {},
+      $: () => ({open: false}), showAuth: () => {},
     };
     vm.createContext(context);
     vm.runInContext(api, context);

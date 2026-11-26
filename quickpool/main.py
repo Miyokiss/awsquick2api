@@ -7,22 +7,29 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.requests import ClientDisconnect
 
 from . import __version__
-from .cli_api import register_cli_routes
+from .admin_api import handle_batch_action, register_admin_routes
+from .api_keys import KeyAuthError, is_claude_client, resolve_user_policy, verify_managed_key
+from .cli_api import estimate_tokens, register_cli_routes
 from .compat import CompatibilityError, Prepared
 from .models import (
     DEFAULT_MODEL,
+    MAX_TOOLS,
     MODEL_IDS,
+    PUBLIC_CLAUDE_MODELS,
     AccountCreate,
     AccountPatch,
+    BatchAccountAction,
     ChatRequest,
     NativeLoginRequest,
     model_options,
@@ -30,7 +37,7 @@ from .models import (
 from .native_auth import AuthError, NativeAuth
 from .native_upstream import Upstream, UpstreamError
 from .pool import Pool, PoolUnavailable
-from .quota import Quotas
+from .quota import Quotas, is_quota_exhausted, summarize_pool_quota
 from .store import Store
 from .transfer import TransferError, export_accounts, import_accounts
 
@@ -42,25 +49,44 @@ class TransferRequest(BaseModel):
     bundle: dict | None = None
 
 
-class ApiKeyCreate(BaseModel):
-    model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
-    name: str = Field(min_length=1, max_length=80)
-
-
 def create_app(data_dir: Path | None = None, transport=None, ws_connect=None):
     @asynccontextmanager
     async def lifespan(app):
         store = Store(data_dir or Path(os.getenv("QUICKPOOL_DATA_DIR", "data")))
         auth = NativeAuth(store, port=int(os.getenv("QUICKPOOL_CALLBACK_PORT", "18080")), transport=transport)
         app.state.store, app.state.auth = store, auth
-        app.state.pool = Pool(store)
+        app.state.quotas = Quotas(auth, transport)
+        app.state.pool = Pool(store, app.state.quotas)
         app.state.upstream = Upstream(store, auth, connect=ws_connect, transport=transport)
-        app.state.quotas = Quotas(auth,transport)
+        app.state.upstream.session_cache.set_ttl(store.get_settings().get("session_cache_ttl", 1800))
         auth.start()
+        quota_task = None
+        if transport is None and ws_connect is None:
+            async def refresh_quotas_loop():
+                await asyncio.sleep(5)
+                while True:
+                    sem = asyncio.Semaphore(2)
+                    async def _one(aid):
+                        async with sem:
+                            try:
+                                await app.state.quotas.refresh(aid)
+                            except Exception:
+                                pass
+                    configured = [a['id'] for a in store.accounts() if a['configured'] and a['enabled']]
+                    if configured:
+                        await asyncio.gather(*(_one(aid) for aid in configured))
+                    await asyncio.sleep(300)
+            quota_task = asyncio.create_task(refresh_quotas_loop())
         print(f"QuickPool {__version__} | Admin key: {store.directory / 'admin.key'}", flush=True)
         try:
             yield
         finally:
+            if quota_task is not None:
+                quota_task.cancel()
+                try:
+                    await quota_task
+                except asyncio.CancelledError:
+                    pass
             await auth.close()
             store.close()
 
@@ -70,14 +96,19 @@ def create_app(data_dir: Path | None = None, transport=None, ws_connect=None):
     @app.middleware("http")
     async def limits_and_headers(request: Request, call_next):
         # Bound both Content-Length and streamed/chunked request bodies.
-        limit = 5 * 1024 * 1024
+        store = getattr(request.app.state, "store", None)
+        max_body_mb = max(1, min(100, int(store.get_settings().get("max_body_mb", 20)))) if store else 20
+        limit = max_body_mb * 1024 * 1024
         total = 0
         chunks = []
-        async for chunk in request.stream():
-            total += len(chunk)
-            if total > limit:
-                return JSONResponse({"error": {"message": "请求体超过 5 MiB", "type": "invalid_request_error"}}, 413)
-            chunks.append(chunk)
+        try:
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > limit:
+                    return JSONResponse({"error": {"message": f"请求体超过 {max_body_mb} MiB", "type": "invalid_request_error"}}, 413)
+                chunks.append(chunk)
+        except ClientDisconnect:
+            return Response(status_code=499)
         request._body = b"".join(chunks)
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -100,13 +131,37 @@ def create_app(data_dir: Path | None = None, transport=None, ws_connect=None):
         if not hmac.compare_digest(token.encode(), request.app.state.store.admin_key.encode()):
             raise HTTPException(401, "管理密钥无效")
 
-    def api_access(request: Request):
+    current_key_ctx: ContextVar[dict] = ContextVar("quickpool_api_key", default={})
+
+    async def api_access(request: Request):
         token = request.headers.get("authorization", "").removeprefix("Bearer ")
         if request.url.path in ('/messages', '/v1/messages', '/messages/count_tokens', '/v1/messages/count_tokens'):
             token = token or request.headers.get('x-api-key', '')
         store = request.app.state.store
-        if not store.authenticate_api_key(token):
+        settings = store.get_settings()
+        if settings.get("client_restriction") == "claude_only":
+            playground_token = request.headers.get("x-quickpool-admin", "")
+            is_playground = bool(playground_token) and hmac.compare_digest(
+                playground_token.encode(), store.admin_key.encode())
+            if not is_playground and not is_claude_client(request.headers, request.url.path):
+                raise HTTPException(403, "仅允许 Claude Code 或 Claude 桌面端调用")
+        if not token or len(token) > 512:
             raise HTTPException(401, "API 密钥无效")
+        try:
+            managed = verify_managed_key(store, token)
+        except KeyAuthError as exc:
+            raise HTTPException(exc.status, exc.message) from None
+        if managed is None:
+            raise HTTPException(401, "API 密钥无效")
+        store.record_api_key_use(managed["id"])
+        if managed['id'] == 'default':
+            current_key_ctx.set({})
+            return
+        current_key_ctx.set({'api_key_id': managed['id'], 'user_id': managed.get('user_id', ''),
+                             'group_name': managed.get('effective_group_name', managed['group_name']),
+                             'allowed_models': managed.get('allowed_models', []),
+                             'max_thinking_effort': managed.get('max_thinking_effort', ''),
+                             'smart_default_effort': managed.get('smart_default_effort', '')})
 
     def get_account(account_id):
         account = app.state.store.account(account_id)
@@ -123,44 +178,55 @@ def create_app(data_dir: Path | None = None, transport=None, ws_connect=None):
         accounts = app.state.store.accounts()
         for account in accounts:
             account["inflight"] = app.state.pool.inflight[account["id"]]
-            account['quota'] = app.state.quotas.cached(account['id'])
-        return {"accounts": accounts, "stats": app.state.store.stats(), "version": __version__,
-                "auth_mode": "desktop-oauth"}
+            quota = app.state.quotas.cached(account['id'])
+            account['quota'] = quota
+            account['quota_exhausted'] = is_quota_exhausted(quota)
+        quota_summary = summarize_pool_quota(accounts, app.state.store)
+        for account in accounts:
+            account['token_stats'] = quota_summary['account_tokens'].get(account['id'])
+        cache = getattr(app.state.upstream, 'session_cache', None)
+        cache_stats = cache.stats() if cache is not None else {
+            "hits": 0, "misses": 0, "hit_rate": 0.0, "active_sessions": 0}
+        return {"accounts": accounts, "stats": app.state.store.stats(), "cache_stats": cache_stats,
+                "pool_quota": quota_summary['pool_quota'],
+                "version": __version__, "auth_mode": "desktop-oauth"}
+
+    @app.get("/api/accounts/{account_id}/detail", dependencies=[Depends(admin)])
+    async def account_detail(account_id: str):
+        account = get_account(account_id)
+        account["inflight"] = app.state.pool.inflight[account_id]
+        quota = app.state.quotas.cached(account_id)
+        account["quota"] = quota
+        account["quota_exhausted"] = is_quota_exhausted(quota)
+        return {
+            "account": account,
+            "stats": app.state.store.account_stats(account_id),
+            "recent_logs": app.state.store.logs(limit=20, account_id=account_id),
+            "auth_events": app.state.store.auth_events(account_id, limit=20),
+        }
+
+    @app.post("/api/accounts/batch", dependencies=[Depends(admin)])
+    async def batch_accounts(body: BatchAccountAction):
+        res = await handle_batch_action(app, body.action, body.account_ids, body.value)
+        affected = sum(1 for item in res["results"] if item.get("ok"))
+        return {"action": body.action, "affected": affected, **res}
 
     @app.get("/api/config", dependencies=[Depends(admin)])
     async def config():
+        store = app.state.store
+        settings = store.get_settings()
+        default_key = store.get_api_key('default')
         return {"api_key_masked": 'sk-quick-••••••••', "model": DEFAULT_MODEL, "models": list(MODEL_IDS), "version": __version__,
-                "strategy": "weighted-least-connections", "max_attempts": 3}
+                "default_key_enabled": bool(default_key and default_key['enabled']),
+                "strategy": settings.get("scheduling_strategy", "weighted"),
+                "max_attempts": settings.get("max_attempts", 3)}
 
     @app.post('/api/config/reveal-key', dependencies=[Depends(admin)])
     async def reveal_key():
         value = app.state.store.reveal_api_key('default')
         if value is None:
-            raise HTTPException(404, '默认密钥已撤销，请在 API 接入页面创建新密钥')
+            raise HTTPException(404, '默认 API 密钥已撤销')
         return {'api_key': value}
-
-    @app.get('/api/keys', dependencies=[Depends(admin)])
-    async def list_api_keys():
-        return {'keys': app.state.store.api_keys()}
-
-    @app.post('/api/keys', dependencies=[Depends(admin)], status_code=201)
-    async def create_api_key(value: ApiKeyCreate):
-        try:
-            return app.state.store.create_api_key(value.name)
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from None
-
-    @app.post('/api/keys/{key_id}/reveal', dependencies=[Depends(admin)])
-    async def reveal_api_key(key_id: str):
-        value = app.state.store.reveal_api_key(key_id)
-        if value is None:
-            raise HTTPException(404, '密钥不存在或已撤销')
-        return {'api_key': value}
-
-    @app.delete('/api/keys/{key_id}', dependencies=[Depends(admin)], status_code=204)
-    async def revoke_api_key(key_id: str):
-        if not app.state.store.revoke_api_key(key_id):
-            raise HTTPException(404, '密钥不存在')
 
     @app.post("/api/accounts", dependencies=[Depends(admin)], status_code=201)
     async def add_account(account: AccountCreate):
@@ -252,6 +318,7 @@ def create_app(data_dir: Path | None = None, transport=None, ws_connect=None):
             app.state.pool.inflight[account_id] += 1
         start = time.monotonic()
         status, message, chars, retry_after = 200, "", 0, 60
+        upstream_error_code = ""
         output = []
         request_id = "test-" + uuid.uuid4().hex
         try:
@@ -261,59 +328,114 @@ def create_app(data_dir: Path | None = None, transport=None, ws_connect=None):
             return {"ok": True, "output": "".join(output)[:2000], "duration_ms": round((time.monotonic() - start) * 1000), "output_chars": chars}
         except UpstreamError as exc:
             status, message, retry_after = exc.status, str(exc), exc.retry_after
+            upstream_error_code = exc.code
             raise HTTPException(502, message) from exc
         except asyncio.CancelledError:
             status = 499
             raise
         finally:
             await app.state.pool.release(account_id, status, retry_after, message)
-            app.state.store.log(request_id, account_id, status, round((time.monotonic() - start) * 1000), chars, message)
+            app.state.store.log(request_id, account_id, status, round((time.monotonic() - start) * 1000), chars, message,
+                                upstream_error_code=upstream_error_code)
 
     @app.get("/api/logs", dependencies=[Depends(admin)])
-    async def logs():
-        return {"requests": app.state.store.logs()}
+    async def logs(account_id: str | None = None, status: str | None = None, model: str | None = None,
+                   api_key_id: str | None = None, q: str | None = None, limit: int = 50, offset: int = 0):
+        bounded = max(1, min(limit, 200))
+        safe_offset = max(0, offset)
+        return app.state.store.logs_page(
+            limit=bounded, offset=safe_offset,
+            account_id=account_id or None, status=status or None,
+            model=model or None, api_key_id=api_key_id or None, q=q or None,
+        )
 
     @app.get("/v1/models", dependencies=[Depends(api_access)])
     async def models():
         return {"object": "list", "data": [{"id": name, "object": "model", "created": 0,
-                    "owned_by": "amazon", "agent_mode": model_options(name)[0],
+                    "owned_by": "anthropic", "agent_mode": model_options(name)[0],
                     "thinking_effort": model_options(name)[1],
                     "thinking_support": 'desktop-normalizes-to-off' if model_options(name)[0] == 'fast' else 'optional'}
-                    for name in MODEL_IDS]}
+                    for name in PUBLIC_CLAUDE_MODELS]}
 
     @app.post("/v1/chat/completions", dependencies=[Depends(api_access)])
     async def completions(value: ChatRequest):
         request_id = "chatcmpl-" + uuid.uuid4().hex
         started = time.monotonic()
         created = int(time.time())
+        settings = app.state.store.get_settings()
+        policy = current_key_ctx.get()
+        api_key_id = policy.get('api_key_id', '')
+        user_id = policy.get('user_id', '')
+        key_group = policy.get('group_name', '')
         try:
-            prepared = Prepared(value)
+            effective_effort = resolve_user_policy(
+                value.model, value.mode, value.effort, value.has_explicit_effort,
+                settings.get('smart_default_effort', 'high'), policy)
+        except KeyAuthError as exc:
+            return JSONResponse({'error': {'message': exc.message, 'type': 'permission_error'}}, exc.status)
+        try:
+            prepared = Prepared(
+                value,
+                max_images=max(1, min(500, int(settings.get("max_images", 50)))),
+                max_image_mb=max(1, min(20, int(settings.get("max_image_mb", 5)))),
+                max_messages=max(10, min(10000, int(settings.get("max_messages", 2000)))),
+                max_tools=settings.get("max_tools", MAX_TOOLS),
+                max_context_mb=max(1, min(100, int(settings.get("max_body_mb", 20)))),
+            )
         except CompatibilityError as exc:
             return JSONResponse({'error':{'message':str(exc),'type':'invalid_request_error'}},400)
+        input_tokens = estimate_tokens(prepared.context if prepared.context is not None else prepared.prompt)
         messages = [{'role':'user','content':prepared.prompt}]
         tried = set()
         last_error = None
         account = None
         iterator = None
         first = ""
-        for _ in range(3):
+        cache = getattr(app.state.upstream, 'session_cache', None)
+        matched_entry, delta_offset = None, 0
+        if cache is not None and prepared.context and len(prepared.context.get('messages') or []) > 1:
+            eligible_ids = app.state.pool.eligible_ids(tried, group_name=key_group)
+            match = cache.match(prepared.context, value.mode, effective_effort, available_account_ids=eligible_ids)
+            if match is not None:
+                matched_entry, delta_offset = match
+                delta_messages = (prepared.context.get('messages') or [])[delta_offset:]
+                cache.record_saved(max(0, input_tokens - estimate_tokens(delta_messages)))
+        stream_state: dict = {}
+        max_attempts = max(1, min(5, int(settings.get("max_attempts", 3))))
+        for attempt_idx in range(max_attempts):
+            preferred = matched_entry.account_id if (attempt_idx == 0 and matched_entry is not None) else None
             try:
-                account = await app.state.pool.acquire(tried)
+                account = await app.state.pool.acquire(tried, preferred_account_id=preferred, group_name=key_group)
             except PoolUnavailable:
                 break
             tried.add(account["id"])
-            iterator = app.state.upstream.stream(account, messages, agent_mode=value.mode,
-                                                 thinking_effort=value.effort, images=prepared.images)
+            use_reuse = matched_entry is not None and account["id"] == matched_entry.account_id
+            stream_state = {}
+            stream_timeout_sec = max(60, min(900, int(settings.get("stream_timeout_sec", 300))))
+            iterator = app.state.upstream.stream(
+                account, messages, agent_mode=value.mode,
+                thinking_effort=effective_effort, images=prepared.images,
+                context=prepared.context,
+                reuse_thread_id=matched_entry.thread_id if use_reuse else None,
+                delta_offset=delta_offset if use_reuse else 0,
+                state_out=stream_state,
+                stream_timeout_sec=stream_timeout_sec,
+            )
             try:
                 first = await anext(iterator)
                 break
             except UpstreamError as exc:
                 last_error = exc
                 await iterator.aclose()
-                await app.state.pool.release(account["id"], exc.status, exc.retry_after, str(exc))
+                await app.state.pool.release(account["id"], exc.status, exc.retry_after, str(exc),
+                                             penalize=exc.retryable)
                 app.state.store.log(uuid.uuid4().hex, account["id"], exc.status,
-                                    round((time.monotonic() - started) * 1000), 0, str(exc), model=value.model)
-                if exc.status not in (401, 403, 429, 502, 503, 504) and exc.status < 500:
+                                    round((time.monotonic() - started) * 1000), 0, str(exc),
+                                    model=value.model, session_hit=bool(stream_state.get('reused')),
+                                    api_key_id=api_key_id, input_tokens=input_tokens,
+                                    output_tokens=0, user_id=user_id, thinking_effort=effective_effort,
+                                    upstream_error_code=exc.code)
+                if not exc.retryable:
                     break
             except BaseException:
                 await iterator.aclose()
@@ -321,15 +443,20 @@ def create_app(data_dir: Path | None = None, transport=None, ws_connect=None):
                 raise
         if not first or account is None or iterator is None:
             message = str(last_error) if last_error else "没有可用账号：请先添加并授权账号，或等待冷却结束"
-            if last_error and last_error.status == 400:
-                return JSONResponse({'error':{'message':message,'type':'invalid_request_error'}},400)
+            if last_error and not last_error.retryable:
+                kind = "invalid_request_error" if last_error.status < 500 else "upstream_error"
+                return JSONResponse({"error": {"message": message, "type": kind}}, last_error.status)
             return JSONResponse({"error": {"message": message, "type": "upstream_unavailable",
                                            "code": "no_available_account"}}, 503, headers={"Retry-After": "10"})
 
         validated_result = []
+        session_reused = bool(stream_state.get('reused'))
+        session_thread_id = stream_state.get('thread_id')
 
         async def output():
+            penalize = True
             status, error, chars, retry_after = 200, "", 0, 60
+            upstream_error_code = ""
             buffered = [first] if prepared.buffered else None
             try:
                 chars += len(first)
@@ -342,19 +469,31 @@ def create_app(data_dir: Path | None = None, transport=None, ws_connect=None):
                 if buffered is not None:
                     validated_result.append(prepared.result(''.join(buffered)))
             except CompatibilityError as exc:
+                penalize = False
                 status, error = 502, str(exc)
+                upstream_error_code = 'invalid_upstream_output'
                 raise
             except UpstreamError as exc:
                 status, error, retry_after = exc.status, str(exc), exc.retry_after
+                upstream_error_code = exc.code
+                penalize = exc.retryable
                 raise
             except (asyncio.CancelledError, GeneratorExit):
                 status = 499
                 raise
             finally:
                 await iterator.aclose()
-                await app.state.pool.release(account["id"], status, retry_after, error)
+                await app.state.pool.release(account["id"], status, retry_after, error, penalize=penalize)
+                if status == 200 and cache is not None and session_thread_id and prepared.context:
+                    cache.save(account["id"], session_thread_id, prepared.context, value.mode, effective_effort)
+                elif status != 200 and cache is not None and session_thread_id:
+                    cache.invalidate(session_thread_id)
                 app.state.store.log(request_id, account["id"], status,
-                                    round((time.monotonic() - started) * 1000), chars, error, model=value.model)
+                                    round((time.monotonic() - started) * 1000), chars, error,
+                                    model=value.model, session_hit=session_reused,
+                                    api_key_id=api_key_id, input_tokens=input_tokens,
+                                    output_tokens=(chars + 3) // 4 if chars else 0, user_id=user_id,
+                                    thinking_effort=effective_effort, upstream_error_code=upstream_error_code)
 
         def chunk(delta, finish=None):
             return {"id": request_id, "object": "chat.completion.chunk", "created": created,
@@ -365,7 +504,9 @@ def create_app(data_dir: Path | None = None, transport=None, ws_connect=None):
                 text = ''.join([delta async for delta in output()])
                 message, finish = validated_result[0]
             except (UpstreamError, CompatibilityError) as exc:
-                return JSONResponse({'error':{'message':str(exc),'type':'upstream_error'}},502)
+                status = exc.status if isinstance(exc, UpstreamError) else 502
+                kind = 'invalid_request_error' if status < 500 else 'upstream_error'
+                return JSONResponse({'error':{'message':str(exc),'type':kind}},status)
             if value.stream:
                 async def buffered_sse():
                     delta = {k:v for k,v in message.items() if k != 'role'}
@@ -405,11 +546,13 @@ def create_app(data_dir: Path | None = None, transport=None, ws_connect=None):
         try:
             text = "".join([delta async for delta in output()])
         except UpstreamError as exc:
-            return JSONResponse({"error": {"message": str(exc), "type": "upstream_error"}}, 502)
+            return JSONResponse({"error": {"message": str(exc),
+                "type": "invalid_request_error" if exc.status < 500 else "upstream_error"}}, exc.status)
         return {"id": request_id, "object": "chat.completion", "created": created, "model": value.model,
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
                              "finish_reason": "stop"}]}
 
+    register_admin_routes(app, admin)
     register_cli_routes(app, completions, api_access)
 
     static = Path(__file__).parent / "static"

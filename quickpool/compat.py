@@ -15,6 +15,8 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from referencing import Registry
 from referencing.exceptions import Unresolvable
 
+from .models import MAX_TOOLS
+
 
 class CompatibilityError(ValueError):
     pass
@@ -46,13 +48,13 @@ def check_instance(instance, schema):
         raise CompatibilityError('Quick 回复不符合请求的 JSON Schema') from None
 
 
-def image_data(url):
+def image_data(url, *, max_image_mb: int = 5):
     # No remote fetch: prevents SSRF and leaking caller credentials to redirects.
     try:
         header, data = url.split(',', 1)
         mime = {'data:image/png;base64':'image/png', 'data:image/jpeg;base64':'image/jpeg'}[header.lower()]
         raw = base64.b64decode(data, validate=True)
-        if not raw or len(raw) > 3 * 1024 * 1024:
+        if not raw or len(raw) > max_image_mb * 1024 * 1024:
             raise ValueError
         if mime == 'image/png' and not raw.startswith(b'\x89PNG\r\n\x1a\n'):
             raise ValueError
@@ -60,15 +62,21 @@ def image_data(url):
             raise ValueError
         return raw, mime
     except (ValueError, KeyError, TypeError, binascii.Error):
-        raise CompatibilityError('图片须为 PNG/JPEG base64 data URL，单图不超过 3 MiB；暂不抓取远程 URL') from None
+        raise CompatibilityError(f'图片须为 PNG/JPEG base64 data URL，单图不超过 {max_image_mb} MiB；暂不抓取远程 URL') from None
 
 
 class Prepared:
-    def __init__(self, request):
+    def __init__(self, request, *, max_images: int = 50, max_image_mb: int = 5,
+                 max_messages: int = 2000, max_tools: int = MAX_TOOLS, max_context_mb: int = 20):
         self.request = request
+        self.max_tools = min(max_tools, MAX_TOOLS)
+        if len(request.messages) > max_messages:
+            raise CompatibilityError(f'每次请求最多 {max_messages} 条消息')
         self.images = []
         self.tools = request.tools or ([{'type':'function', 'function':f} for f in request.functions]
                                        if request.functions else [])
+        if len(self.tools) > self.max_tools:
+            raise CompatibilityError(f'每次请求最多 {self.max_tools} 个工具')
         self.functions = {t['function']['name']: t['function'] for t in self.tools}
         if len(self.functions) != len(self.tools):
             raise CompatibilityError('函数名不能重复')
@@ -101,41 +109,83 @@ class Prepared:
                     if part['type'] == 'text':
                         texts.append(part['text'])
                     else:
-                        self.images.append(image_data(part['image_url']['url']))
+                        self.images.append(image_data(part['image_url']['url'], max_image_mb=max_image_mb))
                         texts.append(f'[图片附件 {len(self.images)}]')
                 item['content'] = '\n'.join(texts)
             messages.append(item)
-        if len(self.images) > 4:
-            raise CompatibilityError('每次请求最多 4 张图片')
+        if len(self.images) > max_images:
+            raise CompatibilityError(f'每次请求最多 {max_images} 张图片')
         if len(messages) == 1 and set(messages[0]) == {'role','content'}:
             self.prompt = messages[0]['content']
         else:
             self.prompt = ('Conversation history (role and tool call IDs are significant):\n'
                            + json.dumps(messages, ensure_ascii=False))
+        instructions = ''
         if self.tools:
-            self.prompt += ('\n\nCLIENT FUNCTION ADAPTER: Return only one JSON object. '
+            instructions += ('CLIENT FUNCTION ADAPTER: Return only one JSON object. '
                 'To request client-side execution return {"tool_calls":[{"name":"declared_name","arguments":{}}]}. '
                 'Otherwise return {"content":"your answer"}. Never claim a function was executed. '
                 'Use only the declared functions, conform to their JSON schemas. '
                 'tool_choice=' + json.dumps(self.choice) + '; parallel_tool_calls=' + str(request.parallel_tool_calls)
                 + '. choice=none forbids tool_calls; required requires them; a named choice requires that function. '
-                + 'Declared functions: ' + json.dumps(self.tools, ensure_ascii=False))
+                + 'Declared functions are in tools below.')
         if self.format['type'] != 'text':
-            self.prompt += '\nReturn a JSON object only, without markdown fences.'
+            instructions += '\nReturn a JSON object only, without markdown fences.'
             if self.format['type'] == 'json_schema':
-                self.prompt += ' Conform to JSON Schema: ' + json.dumps(self.format['json_schema']['schema'])
-        if len(self.prompt) > 200_000:
-            raise CompatibilityError('转换后的上下文过长')
+                instructions += ' Conform to JSON Schema: ' + json.dumps(self.format['json_schema']['schema'])
+        self.context = {'messages': messages, 'tools': self.tools, 'tool_choice': self.choice,
+                        'parallel_tool_calls': request.parallel_tool_calls, 'response_format': self.format,
+                        'adapter_instructions': instructions}
+        if instructions:
+            self.prompt += '\n\n' + instructions
+        if self.tools:
+            self.prompt += '\nDeclared functions: ' + json.dumps(self.tools, ensure_ascii=False)
+        if len(json.dumps(self.context, ensure_ascii=False, separators=(',', ':')).encode('utf-8')) > max_context_mb*1024*1024:
+            raise CompatibilityError(f'转换后的上下文附件超过 {max_context_mb} MiB')
 
     def result(self, text):
         message, finish = {'role':'assistant','content':text}, 'stop'
         if not self.buffered:
             return message, finish
+        commentary = None
         try:
             stripped = text.strip()
             if stripped.startswith('```') and stripped.endswith('```'):
                 stripped = stripped.split('\n', 1)[1].rsplit('```', 1)[0].strip()
-            value = json.loads(stripped)
+            try:
+                value = json.loads(stripped)
+            except ValueError:
+                # Quick can narrate native attachment reads (even with braces or fenced JSON) before the final JSON.
+                if not self.tools or self.format['type'] != 'text':
+                    raise
+                candidate_text = stripped
+                if candidate_text.endswith('```'):
+                    fence = candidate_text.rfind('```json')
+                    if fence == -1:
+                        fence = candidate_text.rfind('```', 0, len(candidate_text) - 3)
+                    if fence > 0:
+                        inner = candidate_text[fence:].split('\n', 1)[-1].rsplit('```', 1)[0].strip()
+                        candidate_text = candidate_text[:fence] + inner
+                value = None
+                start = -1
+                search_from = 0
+                while True:
+                    pos = candidate_text.find('{', search_from)
+                    if pos < 1:
+                        break
+                    try:
+                        parsed = json.loads(candidate_text[pos:])
+                    except ValueError:
+                        search_from = pos + 1
+                        continue
+                    if isinstance(parsed, dict) and (parsed.get('tool_calls') or isinstance(parsed.get('content'), str)):
+                        value, start = parsed, pos
+                        break
+                    search_from = pos + 1
+                if value is None:
+                    raise ValueError
+                if value.get('tool_calls'):
+                    commentary = candidate_text[:start].strip() or None
             if not isinstance(value, dict):
                 raise TypeError
         except (ValueError, TypeError, IndexError):
@@ -143,7 +193,7 @@ class Prepared:
         if self.tools:
             calls = value.get('tool_calls')
             if calls:
-                if self.choice == 'none' or not isinstance(calls,list) or len(calls) > 64:
+                if self.choice == 'none' or not isinstance(calls,list) or len(calls) > self.max_tools:
                     raise CompatibilityError('Quick 回复违反 tool_choice')
                 if not self.request.parallel_tool_calls and len(calls) > 1:
                     raise CompatibilityError('Quick 回复包含不允许的并行调用')
@@ -151,20 +201,29 @@ class Prepared:
                 for call in calls:
                     if not isinstance(call,dict):
                         raise CompatibilityError('Quick 工具调用结构无效')
-                    name, arguments = call.get('name'), call.get('arguments')
+                    fn = call.get('function') if isinstance(call.get('function'), dict) else None
+                    name = call.get('name') if 'name' in call else (fn.get('name') if fn else None)
+                    arguments = call.get('arguments') if 'arguments' in call else (fn.get('arguments') if fn else None)
                     if not isinstance(name,str) or name not in self.functions or (self.selected and name != self.selected):
                         raise CompatibilityError('Quick 请求了未声明或未选中的函数')
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = json.loads(arguments)
+                        except ValueError:
+                            raise CompatibilityError('Quick 工具参数必须为 JSON 对象') from None
+                    elif arguments is None:
+                        arguments = {}
                     if not isinstance(arguments,dict):
                         raise CompatibilityError('Quick 工具参数必须为 JSON 对象')
                     check_instance(arguments, self.functions[name].get('parameters', {'type':'object'}))
                     converted.append({'id':'call_'+uuid.uuid4().hex, 'type':'function',
                         'function':{'name':name,'arguments':json.dumps(arguments,ensure_ascii=False)}})
-                message = {'role':'assistant','content':None, 'tool_calls':converted}
+                message = {'role':'assistant','content':commentary, 'tool_calls':converted}
                 finish = 'tool_calls'
                 if self.request.functions:
                     if len(converted) != 1:
                         raise CompatibilityError('旧版 functions 接口只允许一个调用')
-                    message = {'role':'assistant','content':None,'function_call':converted[0]['function']}
+                    message = {'role':'assistant','content':commentary,'function_call':converted[0]['function']}
                     finish = 'function_call'
                 return message, finish
             if self.choice == 'required' or self.selected:

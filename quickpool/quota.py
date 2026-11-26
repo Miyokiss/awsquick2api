@@ -9,6 +9,41 @@ import httpx
 from .native_auth import AuthError, trusted_url
 
 
+DEFAULT_TOKENS_PER_UNIT = 15000
+
+
+def summarize_pool_quota(accounts, store):
+    totals = store.account_token_totals()
+    pool_tokens = store.pool_token_totals()
+    available = provisioned = count = 0
+    account_tokens = {}
+    for account in accounts:
+        account_id = account['id']
+        monthly = (account.get('quota') or {}).get('monthly') or {}
+        units = monthly.get('availableUnits')
+        provisioned_units = monthly.get('provisionedUnits')
+        if isinstance(units, (int, float)) and isinstance(provisioned_units, (int, float)):
+            available += units
+            provisioned += provisioned_units
+            count += 1
+        tokens = totals.get(account_id, {'tokens_24h': 0, 'tokens_total': 0,
+                                         'input_tokens_total': 0, 'output_tokens_total': 0})
+        account_tokens[account_id] = tokens.copy()
+    used = max(0, provisioned - available)
+    tokens_per_unit = pool_tokens['tokens_total'] / used if used > 0 and pool_tokens['tokens_total'] > 0 else DEFAULT_TOKENS_PER_UNIT
+    basis = 'observed' if used > 0 and pool_tokens['tokens_total'] > 0 else 'heuristic'
+    for account in accounts:
+        monthly = (account.get('quota') or {}).get('monthly') or {}
+        units = monthly.get('availableUnits')
+        account_tokens[account['id']]['estimated_remaining_tokens'] = int(units * tokens_per_unit) if isinstance(units, (int, float)) else 0
+    return {'pool_quota': {'total_available_units': available, 'total_provisioned_units': provisioned,
+                           'total_used_units': used, 'accounts_with_quota': count,
+                           'tokens_24h': pool_tokens['tokens_24h'], 'tokens_total': pool_tokens['tokens_total'],
+                           'estimated_remaining_tokens': int(available * tokens_per_unit),
+                           'tokens_per_unit': tokens_per_unit, 'estimate_basis': basis},
+            'account_tokens': account_tokens}
+
+
 def normalize_usage(summary):
     if not isinstance(summary,dict):
         return {'status':'unavailable','reason':'上游未提供额度数据','updated_at':time.time()}
@@ -46,6 +81,36 @@ def gateway_usage(data):
     rate = entitlement.get('rateLimitStatus') or {}
     return {'monthlyUsage':monthly,'sessionUsage':{'usedPercentage':rate.get('consumptionPercentage'),
                                                  'resumeInMinutes':rate.get('estimatedMinutesToResume')}}
+
+
+def is_quota_exhausted(quota: dict | None) -> bool:
+    if not isinstance(quota, dict) or quota.get('status') != 'available':
+        return False
+    session = quota.get('session') or {}
+    if isinstance(session, dict):
+        used = session.get('usedPercentage')
+        avail = session.get('availableUnits')
+        if (isinstance(used, (int, float)) and used >= 99.5) or (isinstance(avail, (int, float)) and avail <= 0):
+            return True
+    monthly = quota.get('monthly') or {}
+    if isinstance(monthly, dict):
+        used = monthly.get('usedPercentage')
+        avail = monthly.get('availableUnits')
+        if (isinstance(used, (int, float)) and used >= 99.9) or (isinstance(avail, (int, float)) and avail <= 0):
+            return True
+    return False
+
+
+def remaining_score(quota: dict | None) -> float:
+    if not isinstance(quota, dict) or quota.get('status') != 'available':
+        return 50.0
+    session = quota.get('session') or {}
+    if isinstance(session, dict) and isinstance(session.get('usedPercentage'), (int, float)):
+        return max(0.0, min(100.0, 100.0 - float(session['usedPercentage'])))
+    monthly = quota.get('monthly') or {}
+    if isinstance(monthly, dict) and isinstance(monthly.get('usedPercentage'), (int, float)):
+        return max(0.0, min(100.0, 100.0 - float(monthly['usedPercentage'])))
+    return 50.0
 
 
 class Quotas:

@@ -20,6 +20,8 @@ from typing import Any, Literal
 
 import cbor2
 
+from .diagnostics import safe_upstream_code
+
 Transport = Literal["gateway", "aidp"]
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 DESKTOP_SURFACE = "QUICK_WORK_DESKTOP_WINDOWS"
@@ -27,6 +29,10 @@ DESKTOP_SURFACE = "QUICK_WORK_DESKTOP_WINDOWS"
 
 class NativeProtocolError(ValueError):
     """Safe to surface: messages never contain upstream headers or payloads."""
+
+    def __init__(self, message: str, *, code: str = ''):
+        super().__init__(message)
+        self.code = safe_upstream_code(code)
 
 
 @dataclass(frozen=True)
@@ -194,8 +200,9 @@ def encode_message(transport: Transport, message: Mapping[str, Any] | str) -> by
 def decode_frame(transport: Transport, frame: EventStreamFrame) -> dict[str, Any] | None:
     _transport(transport)
     if frame.headers.get(":message-type") in ("error", "exception"):
-        # Error messages/codes may contain user data or credentials: never echo them.
-        raise NativeProtocolError("Quick upstream returned an error frame")
+        code = safe_upstream_code(frame.headers.get(":exception-type")) or safe_upstream_code(
+            frame.headers.get(":error-code"))
+        raise NativeProtocolError("Quick upstream returned an error frame", code=code or 'error_frame')
     if not frame.payload:
         return None
     if transport == "aidp":

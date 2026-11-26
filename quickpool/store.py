@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -13,7 +12,42 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet
 
-from .models import DEFAULT_MODEL, AccountCreate, account_number
+from .api_keys import KeyAuthError, generate_api_key, hash_api_key, verify_managed_key
+from .diagnostics import safe_upstream_code
+from .models import DEFAULT_MODEL, MAX_TOOLS, AccountCreate, ApiKeyCreate, UserCreate, account_number
+
+
+_API_KEY_SELECT = """
+    SELECT k.id, k.name, k.key_prefix, k.notes, k.group_name, k.enabled, k.daily_limit, k.expires_at,
+           k.requests_total, k.last_used, k.created_at, k.user_id, u.name AS user_name,
+           (SELECT COUNT(*) FROM requests WHERE api_key_id=k.id AND created_at>=?) AS requests_today
+    FROM api_keys k LEFT JOIN users u ON u.id=k.user_id
+"""
+_API_KEYS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS api_keys (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE,
+        key_prefix TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '',
+        group_name TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
+        daily_limit INTEGER NOT NULL DEFAULT 0, expires_at REAL NOT NULL DEFAULT 0,
+        requests_total INTEGER NOT NULL DEFAULT 0, last_used REAL NOT NULL DEFAULT 0,
+        created_at REAL NOT NULL, user_id TEXT NOT NULL DEFAULT '',
+        secret BLOB NOT NULL DEFAULT X'', revoked_at REAL NOT NULL DEFAULT 0
+    )
+"""
+_SETTINGS_DEFAULTS = {
+    "scheduling_strategy": "weighted",
+    "session_cache_ttl": 1800,
+    "max_attempts": 3,
+    "max_images": 50,
+    "max_image_mb": 5,
+    "max_messages": 2000,
+    "max_tools": MAX_TOOLS,
+    "max_body_mb": 20,
+    "stream_timeout_sec": 300,
+    "log_retention": 10000,
+    "smart_default_effort": "high",
+    "client_restriction": "off",
+}
 
 
 class Store:
@@ -49,11 +83,22 @@ class Store:
                 id INTEGER PRIMARY KEY, created_at REAL NOT NULL, account_id TEXT NOT NULL,
                 event TEXT NOT NULL, details TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS api_keys (
-                id TEXT PRIMARY KEY, name TEXT NOT NULL, key_hash TEXT UNIQUE NOT NULL,
-                masked TEXT NOT NULL, secret BLOB NOT NULL, created_at REAL NOT NULL,
-                last_used REAL NOT NULL DEFAULT 0, revoked_at REAL NOT NULL DEFAULT 0
+            CREATE TABLE IF NOT EXISTS session_cache (
+                thread_id TEXT PRIMARY KEY, account_id TEXT NOT NULL,
+                config_hash TEXT NOT NULL, msg_hashes TEXT NOT NULL,
+                turns INTEGER NOT NULL DEFAULT 1, updated_at REAL NOT NULL,
+                expires_at REAL NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS session_cache_expires ON session_cache(expires_at);
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1, group_name TEXT NOT NULL DEFAULT '',
+                allowed_models TEXT NOT NULL DEFAULT '[]',
+                max_thinking_effort TEXT NOT NULL DEFAULT '', smart_default_effort TEXT NOT NULL DEFAULT '',
+                daily_request_limit INTEGER NOT NULL DEFAULT 0, daily_token_limit INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
         self.db.commit()
         columns = {row[1] for row in self.db.execute('PRAGMA table_info(accounts)')}
@@ -62,85 +107,61 @@ class Store:
             'auth_provider': "TEXT NOT NULL DEFAULT ''",
             'token_expires_at': 'REAL NOT NULL DEFAULT 0',
             'has_refresh_token': 'INTEGER NOT NULL DEFAULT 0',
+            'group_name': "TEXT NOT NULL DEFAULT ''",
+            'notes': "TEXT NOT NULL DEFAULT ''",
         }.items():
             if name not in columns:
                 self.db.execute(f'ALTER TABLE accounts ADD COLUMN {name} {definition}')
         # Cookie/template credentials must never silently become native accounts.
         self.db.execute("UPDATE accounts SET state='unconfigured' WHERE auth_type!='native'")
+        req_columns = {row[1] for row in self.db.execute('PRAGMA table_info(requests)')}
+        if 'session_hit' not in req_columns:
+            self.db.execute('ALTER TABLE requests ADD COLUMN session_hit INTEGER NOT NULL DEFAULT 0')
+        if 'api_key_id' not in req_columns:
+            self.db.execute("ALTER TABLE requests ADD COLUMN api_key_id TEXT NOT NULL DEFAULT ''")
+        for name, definition in {'input_tokens': 'INTEGER NOT NULL DEFAULT 0',
+                                 'output_tokens': 'INTEGER NOT NULL DEFAULT 0',
+                                 'user_id': "TEXT NOT NULL DEFAULT ''",
+                                  'thinking_effort': "TEXT NOT NULL DEFAULT ''",
+                                  'upstream_error_code': "TEXT NOT NULL DEFAULT ''"}.items():
+            if name not in req_columns:
+                self.db.execute(f'ALTER TABLE requests ADD COLUMN {name} {definition}')
+        self.db.execute("CREATE INDEX IF NOT EXISTS requests_api_key_created ON requests(api_key_id, created_at)")
         self.db.commit()
-        # Register the existing file/env key without rotating it or reviving a revoked key.
-        digest = self._api_key_hash(self.api_key)
+        self._migrate_api_keys()
+
+    def _migrate_api_keys(self):
         with self.lock, self.db:
-            self.db.execute(
-                "INSERT INTO api_keys(id,name,key_hash,masked,secret,created_at) VALUES(?,?,?,?,?,?) "
-                "ON CONFLICT(id) DO UPDATE SET key_hash=excluded.key_hash,masked=excluded.masked,"
-                "secret=excluded.secret,created_at=excluded.created_at,last_used=0,revoked_at=0 "
-                "WHERE api_keys.key_hash!=excluded.key_hash",
-                ('default', '默认密钥', digest, self._mask_api_key(self.api_key),
-                 self.cipher.encrypt(self.api_key.encode()), time.time()))
-
-    @staticmethod
-    def _api_key_hash(value):
-        return hashlib.sha256(value.encode()).hexdigest()
-
-    @staticmethod
-    def _mask_api_key(value):
-        return value[:12] + '••••••••' + value[-4:] if len(value) > 20 else '••••••••'
-
-    @staticmethod
-    def _public_api_key(row):
-        result = {name: row[name] for name in ('id', 'name', 'masked', 'created_at', 'last_used', 'revoked_at')}
-        result['enabled'] = not bool(result['revoked_at'])
-        result['is_default'] = result['id'] == 'default'
-        return result
-
-    def api_keys(self):
-        with self.lock:
-            return [self._public_api_key(row) for row in self.db.execute(
-                'SELECT * FROM api_keys ORDER BY created_at,id')]
-
-    def create_api_key(self, name):
-        name = name.strip()
-        if not 1 <= len(name) <= 80:
-            raise ValueError('密钥名称须为 1–80 个字符')
-        value = 'sk-quick-' + secrets.token_urlsafe(32)
-        key_id = str(uuid.uuid4())
-        with self.lock, self.db:
-            if self.db.execute('SELECT COUNT(*) FROM api_keys WHERE revoked_at=0').fetchone()[0] >= 100:
-                raise ValueError('最多同时启用 100 个 API 密钥，请先撤销不再使用的密钥')
-            self.db.execute(
-                'INSERT INTO api_keys(id,name,key_hash,masked,secret,created_at) VALUES(?,?,?,?,?,?)',
-                (key_id, name, self._api_key_hash(value), self._mask_api_key(value),
-                 self.cipher.encrypt(value.encode()), time.time()))
-            row = self.db.execute('SELECT * FROM api_keys WHERE id=?', (key_id,)).fetchone()
-        return self._public_api_key(row) | {'api_key': value}
-
-    def reveal_api_key(self, key_id):
-        with self.lock:
-            row = self.db.execute('SELECT secret FROM api_keys WHERE id=? AND revoked_at=0',
-                                  (key_id,)).fetchone()
-        return self.cipher.decrypt(row['secret']).decode() if row else None
-
-    def revoke_api_key(self, key_id):
-        with self.lock, self.db:
-            row = self.db.execute('SELECT revoked_at FROM api_keys WHERE id=?', (key_id,)).fetchone()
-            if row is None:
-                return False
-            if not row['revoked_at']:
-                self.db.execute('UPDATE api_keys SET revoked_at=?,secret=? WHERE id=?',
-                                (time.time(), b'', key_id))
-        return True
-
-    def authenticate_api_key(self, token):
-        if not token or len(token) > 512:
-            return False
-        with self.lock, self.db:
-            row = self.db.execute('SELECT id FROM api_keys WHERE key_hash=? AND revoked_at=0',
-                                  (self._api_key_hash(token),)).fetchone()
-            if row is None:
-                return False
-            self.db.execute('UPDATE api_keys SET last_used=? WHERE id=?', (time.time(), row['id']))
-        return True
+            self.db.execute('BEGIN IMMEDIATE')
+            columns = {row[1] for row in self.db.execute('PRAGMA table_info(api_keys)')}
+            legacy = 'masked' in columns and 'key_prefix' not in columns
+            if legacy:
+                self.db.execute('ALTER TABLE api_keys RENAME TO legacy_api_keys')
+            self.db.execute(_API_KEYS_SCHEMA)
+            if legacy:
+                self.db.execute("""
+                    INSERT INTO api_keys(id,name,key_hash,key_prefix,enabled,last_used,created_at,secret,revoked_at)
+                    SELECT id,name,key_hash,masked,revoked_at=0,last_used,created_at,
+                           CASE WHEN revoked_at=0 THEN secret ELSE X'' END,revoked_at
+                    FROM legacy_api_keys
+                """)
+                self.db.execute('DROP TABLE legacy_api_keys')
+            elif columns:
+                for name, definition in {
+                    'user_id': "TEXT NOT NULL DEFAULT ''",
+                    'secret': "BLOB NOT NULL DEFAULT X''",
+                    'revoked_at': 'REAL NOT NULL DEFAULT 0',
+                }.items():
+                    if name not in columns:
+                        self.db.execute(f'ALTER TABLE api_keys ADD COLUMN {name} {definition}')
+            self.db.execute("""
+                INSERT INTO api_keys(id,name,key_hash,key_prefix,secret,created_at)
+                VALUES('default','默认密钥',?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET key_hash=excluded.key_hash,key_prefix=excluded.key_prefix,
+                    secret=excluded.secret,created_at=excluded.created_at,last_used=0,requests_total=0,
+                    enabled=1,revoked_at=0 WHERE api_keys.key_hash!=excluded.key_hash
+            """, (hash_api_key(self.api_key), 'sk-quick-••••••••',
+                  self.cipher.encrypt(self.api_key.encode()), time.time()))
 
     def _key_file(self, name, factory):
         path = self.directory / name
@@ -179,16 +200,18 @@ class Store:
         account_id = str(uuid.uuid4())
         with self.lock, self.db:
             self.db.execute(
-                "INSERT INTO accounts(id,name,login_url,aws_account_id,weight,max_concurrency,created_at) "
-                "VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO accounts"
+                "(id,name,login_url,aws_account_id,weight,max_concurrency,created_at,group_name,notes) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
                 (account_id, account.name.strip(), account.login_url, account_number(account.login_url),
-                 account.weight, account.max_concurrency, time.time()),
+                 account.weight, account.max_concurrency, time.time(),
+                 account.group_name.strip(), account.notes),
             )
         return self.account(account_id)
 
     def patch_account(self, account_id, values):
         allowed = {"name", "enabled", "weight", "max_concurrency", "state", "cooldown_until", "last_error",
-                   "last_used", "successes", "failures"}
+                   "last_used", "successes", "failures", "group_name", "notes"}
         if not values or set(values) - allowed:
             return self.account(account_id)
         with self.lock, self.db:
@@ -240,28 +263,410 @@ class Store:
 
     def delete_account(self, account_id):
         with self.lock, self.db:
+            self.db.execute("DELETE FROM session_cache WHERE account_id=?", (account_id,))
             self.db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
 
-    def log(self, request_id, account_id, status, duration_ms, output_chars, error="", *, model=DEFAULT_MODEL):
+    def load_sessions(self, limit: int = 256):
+        now = time.time()
         with self.lock, self.db:
-            self.db.execute("INSERT INTO requests VALUES(?,?,?,?,?,?,?,?)",
-                            (request_id, time.time(), account_id, model, status,
-                             duration_ms, output_chars, error[:200]))
+            self.db.execute("DELETE FROM session_cache WHERE expires_at<=?", (now,))
+            rows = self.db.execute(
+                "SELECT thread_id,account_id,config_hash,msg_hashes,turns,expires_at "
+                "FROM session_cache ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+        result = []
+        for row in rows:
+            try:
+                hashes = tuple(json.loads(row['msg_hashes']))
+            except (ValueError, TypeError):
+                continue
+            result.append({
+                'thread_id': row['thread_id'],
+                'account_id': row['account_id'],
+                'config_hash': row['config_hash'],
+                'msg_hashes': hashes,
+                'turns': int(row['turns']),
+                'remaining': max(0.0, float(row['expires_at']) - now),
+            })
+        return result
+
+    def save_session(self, thread_id: str, account_id: str, config_hash: str,
+                     msg_hashes: tuple[str, ...], turns: int, ttl: float):
+        now = time.time()
+        with self.lock, self.db:
+            self.db.execute(
+                "INSERT OR REPLACE INTO session_cache"
+                "(thread_id,account_id,config_hash,msg_hashes,turns,updated_at,expires_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (thread_id, account_id, config_hash, json.dumps(list(msg_hashes)),
+                 int(turns), now, now + max(0.0, float(ttl))),
+            )
+
+    def touch_session(self, thread_id: str, expires_at: float):
+        """命中后续期，只更新过期时间，避免重写整条消息哈希。"""
+        now = time.time()
+        with self.lock, self.db:
+            self.db.execute(
+                "UPDATE session_cache SET expires_at=?, updated_at=? WHERE thread_id=?",
+                (now + max(0.0, float(expires_at) - now), now, thread_id),
+            )
+
+    def delete_session(self, thread_id: str):
+        with self.lock, self.db:
+            self.db.execute("DELETE FROM session_cache WHERE thread_id=?", (thread_id,))
+
+    def delete_account_sessions(self, account_id: str):
+        with self.lock, self.db:
+            self.db.execute("DELETE FROM session_cache WHERE account_id=?", (account_id,))
+
+    @staticmethod
+    def _user_public(row):
+        if row is None:
+            return None
+        return dict(row) | {'enabled': bool(row['enabled']), 'allowed_models': json.loads(row['allowed_models'])}
+
+    def list_users(self):
+        today = int(time.time() // 86400 * 86400)
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT u.*, (SELECT COUNT(*) FROM api_keys k WHERE k.user_id=u.id AND k.revoked_at=0) AS key_count, "
+                "(SELECT COUNT(*) FROM requests r WHERE r.user_id=u.id AND r.created_at>=?) AS requests_today, "
+                "(SELECT COUNT(*) FROM requests r WHERE r.user_id=u.id) AS requests_total, "
+                "(SELECT COALESCE(SUM(input_tokens+output_tokens),0) FROM requests r "
+                "WHERE r.user_id=u.id AND r.created_at>=?) AS tokens_today, "
+                "(SELECT COALESCE(SUM(input_tokens+output_tokens),0) FROM requests r "
+                "WHERE r.user_id=u.id) AS tokens_total FROM users u ORDER BY u.created_at", (today, today))
+            return [self._user_public(row) for row in rows]
+
+    def get_user(self, user_id):
+        today = int(time.time() // 86400 * 86400)
+        with self.lock:
+            row = self.db.execute(
+                "SELECT u.*, (SELECT COUNT(*) FROM api_keys k WHERE k.user_id=u.id AND k.revoked_at=0) AS key_count, "
+                "(SELECT COUNT(*) FROM requests r WHERE r.user_id=u.id AND r.created_at>=?) AS requests_today, "
+                "(SELECT COUNT(*) FROM requests r WHERE r.user_id=u.id) AS requests_total, "
+                "(SELECT COALESCE(SUM(input_tokens+output_tokens),0) FROM requests r "
+                "WHERE r.user_id=u.id AND r.created_at>=?) AS tokens_today, "
+                "(SELECT COALESCE(SUM(input_tokens+output_tokens),0) FROM requests r "
+                "WHERE r.user_id=u.id) AS tokens_total FROM users u WHERE u.id=?", (today, today, user_id)).fetchone()
+        return self._user_public(row)
+
+    def create_user(self, data: UserCreate | None = None, **kwargs):
+        if data is None:
+            data = UserCreate(**kwargs)
+        user_id = str(uuid.uuid4())
+        with self.lock, self.db:
+            self.db.execute(
+                "INSERT INTO users(id,name,notes,enabled,group_name,allowed_models,max_thinking_effort,"
+                "smart_default_effort,daily_request_limit,daily_token_limit,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (user_id, data.name, data.notes, data.enabled, data.group_name,
+                 json.dumps(data.allowed_models), data.max_thinking_effort, data.smart_default_effort,
+                 data.daily_request_limit, data.daily_token_limit, time.time()))
+        return self.get_user(user_id)
+
+    def patch_user(self, user_id, values):
+        allowed = {'name', 'notes', 'enabled', 'group_name', 'allowed_models',
+                   'max_thinking_effort', 'smart_default_effort', 'daily_request_limit', 'daily_token_limit'}
+        if not values or set(values) - allowed:
+            return self.get_user(user_id)
+        values = values | ({'allowed_models': json.dumps(values['allowed_models'])}
+                           if 'allowed_models' in values else {})
+        with self.lock, self.db:
+            self.db.execute('UPDATE users SET ' + ','.join(f'{key}=?' for key in values) + ' WHERE id=?',
+                            (*values.values(), user_id))
+        return self.get_user(user_id)
+
+    update_user = patch_user
+
+    def delete_user(self, user_id):
+        with self.lock, self.db:
+            self.db.execute("UPDATE api_keys SET user_id='' WHERE user_id=?", (user_id,))
+            return self.db.execute('DELETE FROM users WHERE id=?', (user_id,)).rowcount > 0
+
+    def account_token_totals(self):
+        with self.lock:
+            rows = self.db.execute(
+                'SELECT account_id, '
+                'COALESCE(SUM(CASE WHEN created_at>=? THEN input_tokens+output_tokens ELSE 0 END),0) AS tokens_24h, '
+                'COALESCE(SUM(input_tokens+output_tokens),0) AS tokens_total, '
+                'COALESCE(SUM(input_tokens),0) AS input_tokens_total, '
+                'COALESCE(SUM(output_tokens),0) AS output_tokens_total '
+                "FROM requests WHERE account_id IS NOT NULL AND account_id!='' GROUP BY account_id",
+                (time.time() - 86400,)).fetchall()
+        return {row['account_id']: {key: row[key] for key in row.keys() if key != 'account_id'} for row in rows}
+
+    def pool_token_totals(self):
+        with self.lock:
+            row = self.db.execute(
+                'SELECT COALESCE(SUM(CASE WHEN created_at>=? THEN input_tokens+output_tokens ELSE 0 END),0) AS tokens_24h, '
+                'COALESCE(SUM(input_tokens+output_tokens),0) AS tokens_total, '
+                'COALESCE(SUM(input_tokens),0) AS input_tokens_total, '
+                'COALESCE(SUM(output_tokens),0) AS output_tokens_total FROM requests',
+                (time.time() - 86400,)).fetchone()
+        return dict(row)
+
+    def list_api_keys(self):
+        with self.lock:
+            rows = self.db.execute(
+                _API_KEY_SELECT + " WHERE k.id!='default' AND k.revoked_at=0 ORDER BY k.created_at",
+                (int(time.time() // 86400 * 86400),))
+            return [dict(row) | {"enabled": bool(row["enabled"])} for row in rows]
+
+    def get_api_key(self, key_id):
+        with self.lock:
+            row = self.db.execute(
+                _API_KEY_SELECT + " WHERE k.id=? AND k.revoked_at=0",
+                (int(time.time() // 86400 * 86400), key_id)).fetchone()
+        return dict(row) | {"enabled": bool(row["enabled"])} if row is not None else None
+
+    def get_api_key_by_hash(self, h):
+        with self.lock:
+            row = self.db.execute(
+                _API_KEY_SELECT + " WHERE k.key_hash=? AND k.revoked_at=0",
+                (int(time.time() // 86400 * 86400), h)).fetchone()
+        return dict(row) | {"enabled": bool(row["enabled"])} if row is not None else None
+
+    def api_keys(self):
+        with self.lock:
+            return [dict(row) | {'enabled': bool(row['enabled']), 'is_default': row['id'] == 'default'}
+                    for row in self.db.execute(
+                        'SELECT id,name,key_prefix AS masked,created_at,last_used,revoked_at,enabled '
+                        'FROM api_keys ORDER BY created_at,id')]
+
+    def create_api_key(self, data: ApiKeyCreate | str | None = None, **kwargs):
+        legacy_call = isinstance(data, str)
+        if legacy_call:
+            data = ApiKeyCreate(name=data)
+        elif data is None:
+            data = ApiKeyCreate(**kwargs)
+        name = data.name.strip()
+        if not name:
+            raise ValueError('密钥名称不能为空')
+        key_id = str(uuid.uuid4())
+        plaintext, key_hash, key_prefix = generate_api_key()
+        with self.lock, self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            if self.db.execute('SELECT COUNT(*) FROM api_keys WHERE enabled=1 AND revoked_at=0').fetchone()[0] >= 100:
+                raise ValueError('最多同时启用 100 个 API 密钥')
+            self.db.execute(
+                "INSERT INTO api_keys(id,name,key_hash,key_prefix,notes,group_name,daily_limit,expires_at,"
+                "created_at,user_id,secret) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (key_id, name, key_hash, key_prefix, data.notes, data.group_name, data.daily_limit,
+                 data.expires_at or 0, time.time(), data.user_id, self.cipher.encrypt(plaintext.encode())),
+            )
+            field = 'api_key' if legacy_call else 'plaintext_key'
+            return self.get_api_key(key_id) | {field: plaintext}
+
+    def reveal_api_key(self, key_id):
+        with self.lock:
+            row = self.db.execute(
+                'SELECT secret FROM api_keys WHERE id=? AND enabled=1 AND revoked_at=0 AND '
+                '(expires_at=0 OR expires_at>?)', (key_id, time.time())).fetchone()
+        return self.cipher.decrypt(row['secret']).decode() if row and row['secret'] else None
+
+    def recoverable_api_key_ids(self):
+        with self.lock:
+            return {row[0] for row in self.db.execute(
+                "SELECT id FROM api_keys WHERE secret!=X'' AND revoked_at=0")}
+
+    def authenticate_api_key(self, token):
+        if not token or len(token) > 512:
+            return False
+        try:
+            key = verify_managed_key(self, token)
+        except KeyAuthError:
+            return False
+        if key is None:
+            return False
+        self.record_api_key_use(key['id'])
+        return True
+
+    def patch_api_key(self, key_id, values):
+        allowed = {"name", "notes", "group_name", "enabled", "daily_limit", "expires_at", "user_id"}
+        if not values or set(values) - allowed:
+            return self.get_api_key(key_id)
+        if "expires_at" in values and values["expires_at"] is None:
+            values = values | {"expires_at": 0}
+        with self.lock, self.db:
+            if key_id == 'default':
+                return None
+            if values.get('enabled'):
+                self.db.execute('BEGIN IMMEDIATE')
+                key = self.get_api_key(key_id)
+                if key and not key['enabled'] and self.db.execute(
+                    'SELECT COUNT(*) FROM api_keys WHERE enabled=1 AND revoked_at=0'
+                ).fetchone()[0] >= 100:
+                    raise ValueError('最多同时启用 100 个 API 密钥')
+            self.db.execute(
+                "UPDATE api_keys SET " + ",".join(f"{key}=?" for key in values)
+                + " WHERE id=? AND revoked_at=0",
+                (*values.values(), key_id),
+            )
+        return self.get_api_key(key_id)
+
+    update_api_key = patch_api_key
+
+    def delete_api_key(self, key_id):
+        with self.lock, self.db:
+            cur = self.db.execute(
+                "UPDATE api_keys SET enabled=0,secret=X'',"
+                "revoked_at=CASE WHEN revoked_at=0 THEN ? ELSE revoked_at END WHERE id=?",
+                (time.time(), key_id))
+            return cur.rowcount > 0
+
+    revoke_api_key = delete_api_key
+
+    def record_api_key_use(self, key_id):
+        with self.lock, self.db:
+            self.db.execute("UPDATE api_keys SET requests_total=requests_total+1, last_used=? WHERE id=?",
+                            (time.time(), key_id))
+
+    def get_settings(self):
+        with self.lock:
+            settings = _SETTINGS_DEFAULTS | {key: json.loads(value) for key, value in
+                                             self.db.execute("SELECT key,value FROM settings")}
+        settings['max_tools'] = max(1, min(MAX_TOOLS, int(settings['max_tools'])))
+        return settings
+
+    def patch_settings(self, values):
+        with self.lock, self.db:
+            self.db.executemany(
+                "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+                ((key, json.dumps(value)) for key, value in values.items()
+                 if key in _SETTINGS_DEFAULTS and value is not None),
+            )
+        return self.get_settings()
+
+    update_settings = patch_settings
+
+    def log(self, request_id, account_id, status, duration_ms, output_chars, error="", *,
+            model=DEFAULT_MODEL, session_hit: bool = False, api_key_id: str = "",
+            input_tokens: int = 0, output_tokens: int = 0, user_id: str = "",
+            thinking_effort: str = "", upstream_error_code: str = ""):
+        retention = max(1000, min(100000, int(self.get_settings().get("log_retention", 10000))))
+        with self.lock, self.db:
+            self.db.execute(
+                "INSERT INTO requests"
+                "(id,created_at,account_id,model,status,duration_ms,output_chars,error,session_hit,api_key_id,"
+                "input_tokens,output_tokens,user_id,thinking_effort,upstream_error_code) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (request_id, time.time(), account_id, model, status,
+                 duration_ms, output_chars, error[:200], 1 if session_hit else 0, api_key_id,
+                 input_tokens, output_tokens, user_id, thinking_effort, safe_upstream_code(upstream_error_code)))
             # Bounded local retention; never log prompts, cookies, or raw upstream bodies.
             self.db.execute("DELETE FROM requests WHERE id IN (SELECT id FROM requests "
-                            "ORDER BY created_at DESC LIMIT -1 OFFSET 10000)")
+                            "ORDER BY created_at DESC LIMIT -1 OFFSET ?)", (retention,))
 
-    def logs(self, limit=100):
+    @staticmethod
+    def _logs_where(account_id, status, model, api_key_id, q):
+        clauses, params = [], []
+        if account_id:
+            clauses.append("r.account_id=?")
+            params.append(account_id)
+        if status == 'ok':
+            clauses.append("r.status=200")
+        elif status == 'error':
+            clauses.append("r.status!=200")
+        elif status and status.isdigit():
+            clauses.append("r.status=?")
+            params.append(int(status))
+        if model is not None:
+            clauses.append("r.model=?")
+            params.append(model)
+        if api_key_id is not None:
+            clauses.append("r.api_key_id=?")
+            params.append(api_key_id)
+        if q:
+            clauses.append("(r.id LIKE ? OR r.error LIKE ? OR r.upstream_error_code LIKE ?)")
+            params.extend((f"%{q}%", f"%{q}%", f"%{q}%"))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        return where, params
+
+    def logs(self, limit=100, *, offset=0, account_id: str | None = None, status: str | None = None,
+             model: str | None = None, api_key_id: str | None = None, q: str | None = None):
+        where, params = self._logs_where(account_id, status, model, api_key_id, q)
         with self.lock:
-            return [dict(row) for row in self.db.execute(
-                "SELECT r.*,a.name AS account_name FROM requests r LEFT JOIN accounts a ON a.id=r.account_id "
-                "ORDER BY r.created_at DESC LIMIT ?", (limit,))]
+            rows = self.db.execute(
+                "SELECT r.*,a.name AS account_name,k.name AS api_key_name FROM requests r "
+                "LEFT JOIN accounts a ON a.id=r.account_id "
+                "LEFT JOIN api_keys k ON k.id=r.api_key_id AND k.revoked_at=0"
+                + where + " ORDER BY r.created_at DESC LIMIT ? OFFSET ?", (*params, limit, offset)).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item['session_hit'] = bool(item.get('session_hit', 0))
+            result.append(item)
+        return result
+
+    def logs_page(self, limit=50, *, offset=0, account_id: str | None = None, status: str | None = None,
+                  model: str | None = None, api_key_id: str | None = None, q: str | None = None):
+        where, params = self._logs_where(account_id, status, model, api_key_id, q)
+        with self.lock:
+            requests = self.logs(limit, offset=offset, account_id=account_id, status=status, model=model,
+                                 api_key_id=api_key_id, q=q)
+            total = self.db.execute("SELECT COUNT(*) FROM requests r" + where, params).fetchone()[0]
+        return {"requests": requests, "total": total, "limit": limit, "offset": offset}
+
+    def analytics(self, hours=24):
+        end = (int(time.time() // 3600) + 1) * 3600
+        start = end - hours * 3600
+        window = " WHERE r.created_at>=? AND r.created_at<?"
+        avg_ms = "COALESCE(AVG(CASE WHEN status=200 THEN duration_ms END),0) AS avg_ms"
+        with self.lock:
+            buckets = {row["hour_ts"]: dict(row) for row in self.db.execute(
+                "SELECT CAST(created_at / 3600 AS INTEGER) * 3600 AS hour_ts, COUNT(*) AS total, "
+                "SUM(status=200) AS success, SUM(status!=200) AS failed, SUM(session_hit=1) AS cache_hits, "
+                + avg_ms + " FROM requests r" + window + " GROUP BY hour_ts", (start, end))}
+            models = [dict(row) for row in self.db.execute(
+                "SELECT model, COUNT(*) AS total, SUM(status=200) AS success, "
+                + avg_ms + " FROM requests r" + window + " GROUP BY model ORDER BY total DESC", (start, end))]
+            keys = [dict(row) for row in self.db.execute(
+                "SELECT r.api_key_id, CASE WHEN r.api_key_id='' THEN '主 API Key' ELSE k.name END AS name, "
+                "COUNT(*) AS total, SUM(status=200) AS success "
+                "FROM requests r LEFT JOIN api_keys k ON k.id=r.api_key_id AND k.revoked_at=0"
+                + window + " GROUP BY r.api_key_id ORDER BY total DESC", (start, end))]
+            user_rows = [dict(row) for row in self.db.execute(
+                "SELECT CASE WHEN r.user_id!='' THEN r.user_id WHEN r.api_key_id!='' THEN 'key:' || r.api_key_id ELSE '' END AS group_key, "
+                "CASE WHEN r.user_id!='' THEN COALESCE(u.name, '已删除用户') "
+                "WHEN r.api_key_id!='' THEN COALESCE(k.name, '已删除 Key') ELSE '主 API Key' END AS name, "
+                "COUNT(*) AS total, SUM(r.status=200) AS success, "
+                "COALESCE(SUM(r.input_tokens),0) AS input_tokens, "
+                "COALESCE(SUM(r.output_tokens),0) AS output_tokens, "
+                "COALESCE(SUM(r.input_tokens + r.output_tokens),0) AS tokens "
+                "FROM requests r LEFT JOIN users u ON u.id=r.user_id "
+                "LEFT JOIN api_keys k ON k.id=r.api_key_id AND k.revoked_at=0"
+                + window + " GROUP BY group_key ORDER BY tokens DESC, total DESC", (start, end))]
+        total_user_tokens = sum(row["tokens"] for row in user_rows)
+        users = [{
+            "name": row["name"],
+            "total": row["total"],
+            "success": row["success"],
+            "input_tokens": row["input_tokens"],
+            "output_tokens": row["output_tokens"],
+            "tokens": row["tokens"],
+            "share_percent": round(100.0 * row["tokens"] / total_user_tokens, 1) if total_user_tokens > 0 else 0.0,
+        } for row in user_rows]
+        empty = {"total": 0, "success": 0, "failed": 0, "cache_hits": 0, "avg_ms": 0}
+        hourly = [buckets.get(hour, {"hour_ts": hour, **empty}) for hour in range(start, end, 3600)]
+        return {"hours": hours, "hourly": hourly, "models": models, "keys": keys, "users": users,
+                "total_tokens": total_user_tokens}
+
+    def account_stats(self, account_id: str):
+        with self.lock:
+            row = self.db.execute(
+                "SELECT COUNT(*) total, COALESCE(SUM(status=200),0) success, "
+                "COALESCE(AVG(CASE WHEN status=200 THEN duration_ms END),0) avg_ms, "
+                "COALESCE(SUM(session_hit=1),0) session_hits "
+                "FROM requests WHERE account_id=? AND created_at>=?",
+                (account_id, time.time() - 86400)).fetchone()
+        return dict(row)
 
     def stats(self):
         with self.lock:
             row = self.db.execute(
                 "SELECT COUNT(*) total, COALESCE(SUM(status=200),0) success, "
-                "COALESCE(AVG(CASE WHEN status=200 THEN duration_ms END),0) avg_ms "
+                "COALESCE(AVG(CASE WHEN status=200 THEN duration_ms END),0) avg_ms, "
+                "COALESCE(SUM(session_hit=1),0) session_hits "
                 "FROM requests WHERE created_at>=?", (time.time() - 86400,)).fetchone()
         return dict(row)
 

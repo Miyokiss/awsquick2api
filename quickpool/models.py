@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 DEFAULT_LOGIN_URL = "https://quick.aws.com/sn"
+MAX_TOOLS = 128
 
 
 def allowed_upstream(url: str) -> str:
@@ -26,6 +27,8 @@ class AccountCreate(BaseModel):
     login_url: str = DEFAULT_LOGIN_URL
     weight: int = Field(default=1, ge=1, le=100)
     max_concurrency: int = Field(default=1, ge=1, le=8)
+    group_name: str = Field(default="", max_length=40)
+    notes: str = Field(default="", max_length=300)
 
     @field_validator("login_url")
     @classmethod
@@ -43,6 +46,79 @@ class AccountPatch(BaseModel):
     enabled: bool | None = None
     weight: int | None = Field(default=None, ge=1, le=100)
     max_concurrency: int | None = Field(default=None, ge=1, le=8)
+    group_name: str | None = Field(default=None, max_length=40)
+    notes: str | None = Field(default=None, max_length=300)
+
+
+class BatchAccountAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["enable", "disable", "clear_cooldown", "refresh_quota", "test",
+                    "set_weight", "set_concurrency"]
+    account_ids: list[str] = Field(min_length=1, max_length=100)
+    value: int | None = Field(default=None, ge=1, le=100)
+
+
+class ApiKeyCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=80)
+    notes: str = Field(default="", max_length=300)
+    group_name: str = Field(default="", max_length=40)
+    daily_limit: int = Field(default=0, ge=0, le=1000000)
+    expires_at: float | None = None
+    user_id: str = Field(default="", max_length=64)
+
+
+class ApiKeyPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    notes: str | None = Field(default=None, max_length=300)
+    group_name: str | None = Field(default=None, max_length=40)
+    enabled: bool | None = None
+    daily_limit: int | None = Field(default=None, ge=0, le=1000000)
+    expires_at: float | None = None
+    user_id: str | None = Field(default=None, max_length=64)
+
+
+class UserCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=80)
+    notes: str = Field(default="", max_length=300)
+    enabled: bool = True
+    group_name: str = Field(default="", max_length=40)
+    allowed_models: list[str] = Field(default_factory=list, max_length=32)
+    max_thinking_effort: Literal["", "off", "low", "medium", "high"] = ""
+    smart_default_effort: Literal["", "off", "low", "medium", "high"] = ""
+    daily_request_limit: int = Field(default=0, ge=0, le=1000000)
+    daily_token_limit: int = Field(default=0, ge=0, le=1000000000)
+
+
+class UserPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    notes: str | None = Field(default=None, max_length=300)
+    enabled: bool | None = None
+    group_name: str | None = Field(default=None, max_length=40)
+    allowed_models: list[str] | None = Field(default=None, max_length=32)
+    max_thinking_effort: Literal["", "off", "low", "medium", "high"] | None = None
+    smart_default_effort: Literal["", "off", "low", "medium", "high"] | None = None
+    daily_request_limit: int | None = Field(default=None, ge=0, le=1000000)
+    daily_token_limit: int | None = Field(default=None, ge=0, le=1000000000)
+
+
+class SettingsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    scheduling_strategy: Literal["weighted", "quota_first", "round_robin"] | None = None
+    session_cache_ttl: int | None = Field(default=None, ge=60, le=86400)
+    max_attempts: int | None = Field(default=None, ge=1, le=5)
+    max_images: int | None = Field(default=None, ge=1, le=500)
+    max_image_mb: int | None = Field(default=None, ge=1, le=20)
+    max_messages: int | None = Field(default=None, ge=10, le=10000)
+    max_tools: int | None = Field(default=None, ge=1, le=MAX_TOOLS)
+    max_body_mb: int | None = Field(default=None, ge=1, le=100)
+    stream_timeout_sec: int | None = Field(default=None, ge=60, le=900)
+    log_retention: int | None = Field(default=None, ge=1000, le=100000)
+    smart_default_effort: Literal["off", "low", "medium", "high"] | None = None
+    client_restriction: Literal["off", "claude_only"] | None = None
 
 
 class NativeLoginRequest(BaseModel):
@@ -64,14 +140,12 @@ class Message(BaseModel):
     def validate_parts(self):
         if self.content is None and not (self.role == 'assistant' and (self.tool_calls or self.function_call)):
             raise ValueError('消息必须含 content，或 assistant.tool_calls')
-        if isinstance(self.content, str) and len(self.content) > 120_000:
-            raise ValueError('单条文本过长')
         if isinstance(self.content, list):
             if len(self.content) > 32:
                 raise ValueError('消息内容分段过多')
             for part in self.content:
                 if part.get('type') == 'text':
-                    if not isinstance(part.get('text'), str) or len(part['text']) > 120_000:
+                    if not isinstance(part.get('text'), str):
                         raise ValueError('text 分段无效')
                 elif part.get('type') == 'image_url':
                     image = part.get('image_url')
@@ -91,11 +165,55 @@ NATIVE_MODES = ('fast', 'balanced', 'smart')
 
 MODEL_IDS = tuple('amazon-' + mode + suffix for mode in NATIVE_MODES
                   for suffix in ('', '-low', '-medium', '-high'))
+PUBLIC_CLAUDE_MODELS = (
+    'claude-opus-5-5',
+    'claude-sonnet-4-6',
+    'claude-haiku-4-5',
+)
 MODEL_ALIASES = {mode + suffix: 'amazon-' + mode + suffix
                  for mode in NATIVE_MODES for suffix in ('', '-low', '-medium', '-high')}
+MODEL_ALIASES.update({f'{prefix}{mode}-max': f'amazon-{mode}-high'
+                      for mode in NATIVE_MODES for prefix in ('', 'amazon-')})
+MODEL_ALIASES.update(opus='amazon-smart', sonnet='amazon-balanced', haiku='amazon-fast')
+_EFFORT_MAP = {
+    'none': 'off', 'off': 'off', 'disabled': 'off',
+    'minimal': 'low', 'low': 'low',
+    'medium': 'medium',
+    'high': 'high', 'xhigh': 'high', 'max': 'high', 'ultra': 'high',
+}
+
+
+def normalize_effort(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        mapped = _EFFORT_MAP.get(value.strip().lower())
+        if mapped is not None:
+            return mapped
+    raise ValueError('thinking/reasoning effort 无效')
+
+
+def budget_to_effort(budget: int) -> str:
+    if budget <= 0:
+        return 'off'
+    return 'high' if budget >= 16384 else 'medium' if budget >= 8192 else 'low'
 
 
 def model_options(model: str):
+    claude = re.fullmatch(
+        r'claude-(?:\d+(?:-\d+)*-)?(opus|sonnet|haiku)(?:-\d+(?:-\d+)*|-latest)?(?:-(off|low|medium|high|max|thinking))?',
+        model,
+    )
+    if claude:
+        mode = MODEL_ALIASES[claude[1]].removeprefix('amazon-')
+        suffix = claude[2]
+        if suffix == 'thinking':
+            effort = 'high'
+        elif suffix:
+            effort = _EFFORT_MAP[suffix]
+        else:
+            effort = 'off'
+        return mode, effort
     canonical = MODEL_ALIASES.get(model, model)
     if canonical not in MODEL_IDS:
         raise ValueError('未知模型名，请从 GET /v1/models 选择')
@@ -106,15 +224,18 @@ def model_options(model: str):
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     model: str = Field(default=DEFAULT_MODEL, min_length=1, max_length=128)
-    messages: list[Message] = Field(min_length=1, max_length=100)
+    messages: list[Message] = Field(min_length=1, max_length=10000)
     stream: bool = False
     stream_options: dict[str, Any] | None = None
-    reasoning_effort: Literal['none', 'minimal', 'low', 'medium', 'high', 'off'] | None = None
+    reasoning_effort: Literal['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'off'] | None = None
+    reasoning: dict[str, Any] | None = None
+    thinking: dict[str, Any] | None = None
+    output_config: dict[str, Any] | None = None
     agent_mode: Literal['fast', 'balanced', 'smart'] | None = None
-    thinking_effort: Literal['off', 'low', 'medium', 'high'] | None = None
-    tools: list[dict[str, Any]] | None = Field(default=None, max_length=64)
+    thinking_effort: Literal['off', 'low', 'medium', 'high', 'max'] | None = None
+    tools: list[dict[str, Any]] | None = Field(default=None, max_length=MAX_TOOLS)
     tool_choice: str | dict[str, Any] | None = None
-    functions: list[dict[str, Any]] | None = Field(default=None, max_length=64)
+    functions: list[dict[str, Any]] | None = Field(default=None, max_length=MAX_TOOLS)
     function_call: str | dict[str, Any] | None = None
     parallel_tool_calls: bool = True
     response_format: dict[str, Any] | None = None
@@ -123,19 +244,47 @@ class ChatRequest(BaseModel):
     def mode(self):
         return self.agent_mode or model_options(self.model)[0]
 
+    def _explicit_effort(self) -> str | None:
+        if self.thinking_effort is not None:
+            return normalize_effort(self.thinking_effort)
+        if self.reasoning_effort is not None:
+            return normalize_effort(self.reasoning_effort)
+        if isinstance(self.reasoning, dict) and self.reasoning.get('effort') is not None:
+            return normalize_effort(self.reasoning['effort'])
+        if isinstance(self.thinking, dict):
+            kind = self.thinking.get('type')
+            if kind == 'disabled':
+                return 'off'
+            if isinstance(self.output_config, dict) and self.output_config.get('effort') is not None:
+                return normalize_effort(self.output_config['effort'])
+            if kind == 'enabled':
+                budget = self.thinking.get('budget_tokens')
+                if isinstance(budget, int) and not isinstance(budget, bool):
+                    return budget_to_effort(budget)
+                return 'medium'
+            if kind == 'adaptive':
+                return 'medium'
+        if isinstance(self.output_config, dict) and self.output_config.get('effort') is not None:
+            return normalize_effort(self.output_config['effort'])
+        suffix_effort = model_options(self.model)[1]
+        if suffix_effort != 'off' or self.model.endswith('-off'):
+            return suffix_effort
+        return None
+
+    @property
+    def has_explicit_effort(self) -> bool:
+        return self._explicit_effort() is not None
+
     @property
     def effort(self):
-        return self.thinking_effort or {'none':'off', 'minimal':'low', 'off':'off'}.get(
-            self.reasoning_effort, self.reasoning_effort or model_options(self.model)[1])
+        explicit = self._explicit_effort()
+        return explicit if explicit is not None else model_options(self.model)[1]
 
     @model_validator(mode="after")
     def supported(self):
         model_options(self.model)
         if self.messages[-1].role not in ('user', 'tool', 'function'):
             raise ValueError('最后一条消息必须为 user 或工具执行结果')
-        if sum(len(m.content) if isinstance(m.content,str) else sum(len(p.get('text',''))
-            for p in (m.content or [])) for m in self.messages) > 150_000:
-            raise ValueError("上下文过长")
         if self.model_extra and 'audio' in self.model_extra:
             raise ValueError('暂不支持音频输出')
         if self.tools and self.functions:

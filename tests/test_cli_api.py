@@ -38,12 +38,113 @@ def test_model_vocabulary_reaches_upstream_unchanged(gateway, protocol, model):
     assert response.json()['model'] == model
     mode, _, effort = model.removeprefix('amazon-').partition('-')
     native = next(m['payload'] for m in backend.connections[-1]['socket'].sent if m['type'] == 'user_message')
-    assert native['agent_mode'] == mode and native['thinking_effort'] == (effort or 'off')
+    default = 'high' if mode == 'smart' else 'off'
+    assert native['agent_mode'] == mode and native['thinking_effort'] == (effort or default)
+
+
+@pytest.mark.parametrize('protocol', ['chat/completions', 'responses', 'messages'])
+@pytest.mark.parametrize('model, mode', [
+    ('opus', 'smart'), ('sonnet', 'balanced'), ('haiku', 'fast'),
+    ('claude-opus-4-6', 'smart'), ('claude-sonnet-4-6', 'balanced'),
+    ('claude-haiku-4-5-20251001', 'fast'), ('claude-opus-latest', 'smart'),
+    ('claude-3-7-sonnet-20250219', 'balanced'), ('claude-3-haiku-20240307', 'fast'),
+])
+def test_claude_model_alias_selects_native_mode(gateway, protocol, model, mode):
+    client, _app, _admin, key, backend = gateway
+    add(gateway, state='ready')
+    response = client.post('/v1/' + protocol, headers=key, json=payload(protocol, model=model))
+    assert response.status_code == 200, response.text
+    assert response.json()['model'] == model
+    native = next(m['payload'] for m in backend.connections[-1]['socket'].sent if m['type'] == 'user_message')
+    assert native['agent_mode'] == mode and native['thinking_effort'] == ('high' if mode == 'smart' else 'off')
+
+
+@pytest.mark.parametrize('model, mode', [('claude-opus-4-6', 'smart'),
+                                       ('claude-sonnet-4-6', 'balanced'), ('claude-haiku-4-5', 'fast')])
+def test_claude_messages_stream_preserves_alias_and_thinking(gateway, model, mode):
+    client, _app, _admin, key, backend = gateway
+    add(gateway, state='ready')
+    body = payload('messages', True, model=model, thinking={'type': 'enabled', 'budget_tokens': 8192})
+    response = client.post('/v1/messages', headers=key, json=body)
+    assert response.status_code == 200, response.text
+    data = events(response)
+    assert data[0]['message']['model'] == model and data[-1]['type'] == 'message_stop'
+    native = next(m['payload'] for m in backend.connections[-1]['socket'].sent if m['type'] == 'user_message')
+    assert native['agent_mode'] == mode and native['thinking_effort'] == 'medium'
+    before = len(backend.connections)
+    counted = client.post('/v1/messages/count_tokens', headers=key, json=body)
+    assert counted.status_code == 200 and counted.json()['input_tokens'] > 0
+    assert len(backend.connections) == before
+
+
+@pytest.mark.parametrize('extra,expected_effort', [
+    ({'reasoning_effort': 'none'}, 'off'),
+    ({'reasoning_effort': 'minimal'}, 'low'),
+    ({'reasoning_effort': 'low'}, 'low'),
+    ({'reasoning_effort': 'medium'}, 'medium'),
+    ({'reasoning_effort': 'high'}, 'high'),
+    ({'reasoning_effort': 'xhigh'}, 'high'),
+    ({'reasoning_effort': 'max'}, 'high'),
+    ({'reasoning': {'effort': 'low'}}, 'low'),
+    ({'thinking': {'type': 'disabled'}}, 'off'),
+    ({'thinking': {'type': 'enabled', 'budget_tokens': 2048}}, 'low'),
+    ({'thinking': {'type': 'enabled', 'budget_tokens': 10000}}, 'medium'),
+    ({'thinking': {'type': 'enabled', 'budget_tokens': 20000}}, 'high'),
+    ({'thinking': {'type': 'adaptive'}}, 'medium'),
+    ({'thinking': {'type': 'adaptive'}, 'output_config': {'effort': 'low'}}, 'low'),
+    ({'model': 'claude-opus-5-5-low'}, 'low'),
+    ({'model': 'claude-sonnet-4-6-medium'}, 'medium'),
+    ({'model': 'claude-opus-5-5-high'}, 'high'),
+    ({'model': 'claude-opus-5-5-off'}, 'off'),
+])
+def test_chat_completions_maps_client_thinking_depth_variants(gateway, extra, expected_effort):
+    client, _app, _admin, key, backend = gateway
+    add(gateway, state='ready')
+    body = {'model': 'claude-opus-5-5', 'messages': [{'role': 'user', 'content': 'hello'}], **extra}
+    response = client.post('/v1/chat/completions', headers=key, json=body)
+    assert response.status_code == 200, response.text
+    native = next(m['payload'] for m in backend.connections[-1]['socket'].sent if m['type'] == 'user_message')
+    assert native['thinking_effort'] == expected_effort
+
+
+def test_max_tools_setting_enforces_128_and_configured_lower_limits(gateway):
+    client, _app, admin, key, _backend = gateway
+    add(gateway, state='ready', behavior={'reply': '{"content":"ok"}'})
+    tools = [{'name': f'tool_{i}', 'input_schema': {'type': 'object'}} for i in range(129)]
+    body = {
+        'model': 'claude-opus-5-5', 'max_tokens': 100,
+        'messages': [{'role': 'user', 'content': 'hi'}],
+    }
+    r_ok = client.post('/v1/messages', headers=key, json=body | {'tools': tools[:128]})
+    assert r_ok.status_code == 200, r_ok.text
+    over = client.post('/v1/messages/count_tokens', headers=key, json=body | {'tools': tools})
+    assert over.status_code == 400 and '128' in over.text
+
+    patch = client.patch('/api/settings', headers=admin, json={'max_tools': 50})
+    assert patch.status_code == 200 and patch.json()['max_tools'] == 50
+    r_bad = client.post('/v1/messages', headers=key, json=body | {'tools': tools[:51]})
+    assert r_bad.status_code == 400
+    assert '50' in r_bad.text
+
+
+def test_responses_namespaces_enforce_the_expanded_limit(gateway):
+    client, _, _, key, backend = gateway
+    add(gateway, state='ready', behavior={'reply': '{"content":"ok"}'})
+    definitions = [{'type': 'function', 'name': f'tool_{i}'} for i in range(129)]
+    body = {'model': 'claude-opus-5-5', 'input': 'hi'}
+    namespace = {'type': 'namespace', 'name': 'fixture'}
+    first = namespace | {'tools': definitions[:128]}
+    assert client.post('/v1/responses', headers=key, json=body | {'tools': [first]}).status_code == 200
+    extra = namespace | {'name': 'extra', 'tools': definitions[128:]}
+    too_many = client.post('/v1/responses', headers=key, json=body | {'tools': [first, extra]})
+    assert too_many.status_code == 400 and '128' in too_many.text
+    assert len(backend.connections) == 1
 
 
 @pytest.mark.parametrize('protocol', ['responses', 'messages'])
 @pytest.mark.parametrize('old', ['amazon-quick', 'amazon-quick-high', 'quick-medium',
-                               'amazon-balance', 'amazon-balance-high', 'balance-low', 'hark'])
+                               'amazon-balance', 'amazon-balance-high', 'balance-low', 'hark',
+                               'claude-unknown-4-6', 'claude-sonnet-invalid', 'gpt-unknown'])
 def test_removed_model_names_are_rejected(gateway, protocol, old):
     client, _app, _admin, key, backend = gateway
     add(gateway, state='ready')
